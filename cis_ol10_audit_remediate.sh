@@ -287,6 +287,85 @@ fix_kmod() {
     printf '%s\n' "install $mod /bin/false" "blacklist $mod" > "/etc/modprobe.d/60-${mod}.conf"
 }
 
+# --- 1.1.1.11 — Discover unused filesystem kernel modules ----------------------
+audit_1_1_1_11() {
+    require_cmd findmnt lsmod modprobe || return $?
+
+    # Gather all available fs kernel module directories (skip nls – not a real fs)
+    local kver mod_dir mod_name
+    local -a unused=()
+
+    # Collect mounted filesystem types
+    local -A mounted_fs=()
+    while IFS= read -r t; do
+        [[ -n "$t" ]] && mounted_fs["$t"]=1
+    done < <(findmnt -Dkerno fstype 2>/dev/null | sort -u)
+
+    # Collect loaded modules (normalise - → _)
+    local -A loaded_mods=()
+    while IFS= read -r m; do
+        [[ -n "$m" ]] && loaded_mods["$m"]=1
+    done < <(lsmod 2>/dev/null | awk 'NR>1{print $1}')
+
+    # Collect already-disabled modules from modprobe config
+    local modprobe_cfg
+    modprobe_cfg="$(modprobe --showconfig 2>/dev/null)"
+    local -A disabled_mods=()
+    while IFS= read -r m; do
+        [[ -n "$m" ]] && disabled_mods["$m"]=1
+    done < <(grep -Po '^\h*(blacklist|install)\h+\K\S+' <<< "$modprobe_cfg" 2>/dev/null | sort -u)
+
+    # Walk available fs module directories
+    for kver in /usr/lib/modules/*/kernel/fs /lib/modules/*/kernel/fs; do
+        [[ -d "$kver" ]] || continue
+        for mod_dir in "$kver"/*/; do
+            [[ -d "$mod_dir" ]] || continue
+            mod_name="$(basename "$mod_dir")"
+            # Skip nls (character-encoding helpers, not a filesystem)
+            [[ "$mod_name" == "nls" || "$mod_name" == "lockd" || "$mod_name" == "nfs_common" ]] && continue
+
+            local mod_norm="${mod_name//-/_}"
+
+            # Skip if mounted, loaded, or already disabled
+            [[ -n "${mounted_fs[$mod_name]+x}" ]] && continue
+            [[ -n "${mounted_fs[$mod_norm]+x}" ]] && continue
+            [[ -n "${loaded_mods[$mod_name]+x}" ]] && continue
+            [[ -n "${loaded_mods[$mod_norm]+x}" ]] && continue
+            [[ -n "${disabled_mods[$mod_name]+x}" ]] && continue
+            [[ -n "${disabled_mods[$mod_norm]+x}" ]] && continue
+
+            unused+=("$mod_name")
+        done
+    done
+
+    if [[ ${#unused[@]} -eq 0 ]]; then
+        return 0
+    fi
+
+    CHECK_DETAIL="Unused/unblacklisted filesystem modules found: ${unused[*]}"
+    # Stash the list for the fix function (pipe-delimited)
+    _UNUSED_FS_MODS="$(IFS='|'; echo "${unused[*]}")"
+    export _UNUSED_FS_MODS
+    return 1
+}
+
+fix_1_1_1_11() {
+    local mod ans
+    IFS='|' read -r -a mods <<< "$_UNUSED_FS_MODS"
+    for mod in "${mods[@]}"; do
+        [[ -z "$mod" ]] && continue
+        if [[ "$AUTO_YES" -eq 1 ]]; then
+            ans="y"
+        else
+            read -r -p "  -> Filesystem module '$mod' is available but not in use. Disable it? [Y/n] " ans
+        fi
+        case "${ans,,}" in
+            ""|y|yes) fix_kmod "$mod"; printf "       Disabled %s\n" "$mod" ;;
+            *) printf "       Skipped %s\n" "$mod" ;;
+        esac
+    done
+}
+
 # --- Mount Points & Options (1.1.2.*) -----------------------------------------
 audit_mount_exists() {
     local mnt="$1"
@@ -589,7 +668,7 @@ run_section_1() {
     run_check "1.1.1.8"  "L2S,L2W" "AUTO" "Ensure udf kernel module is not available"           "audit_kmod udf fs"           "fix_kmod udf"           "blacklisting and disabling udf module"
     run_check "1.1.1.9"  "L1S,L2W" "AUTO" "Ensure firewire-core kernel module is not available" "audit_kmod firewire-core drivers/firewire" "fix_kmod firewire-core" "blacklisting and disabling firewire-core module"
     run_check "1.1.1.10" "L1S,L2W" "AUTO" "Ensure usb-storage kernel module is not available"   "audit_kmod usb-storage drivers/usb/storage" "fix_kmod usb-storage" "blacklisting and disabling usb-storage module"
-    run_check "1.1.1.11" "L1S,L1W" "MANUAL" "Ensure unused filesystems kernel modules are not available" "manual_only" "manual_only" "Review loaded/available filesystem modules (lsmod / /usr/lib/modules/*/kernel/fs) and disable unused ones in /etc/modprobe.d/"
+    run_check "1.1.1.11" "L1S,L1W" "AUTO" "Ensure unused filesystems kernel modules are not available" "audit_1_1_1_11" "fix_1_1_1_11" "disabling unused filesystem kernel modules via /etc/modprobe.d/"
 
     # 1.1.2 Filesystem Partitions
     run_check "1.1.2.1.1" "L1S,L1W" "AUTO" "Ensure /tmp is tmpfs or a separate partition" "audit_mount_exists /tmp" "fix_1_1_2_1_1" "enabling systemd tmp.mount for /tmp"
@@ -1107,7 +1186,7 @@ fix_2_4_2_1() {
 run_section_3() {
     echo -e "\n${C_BOLD}=== Section 3: Network ===${C_RESET}"
 
-    run_check "3.1.1" "L1S,L1W" "MANUAL" "Ensure IPv6 status is identified" "manual_only" "manual_only" "Verify IPv6 status matches site policy (/sys/module/ipv6/parameters/disable)"
+    run_check "3.1.1" "L1S,L1W" "MANUAL" "Ensure IPv6 status is identified" "audit_3_1_1" "fix_3_1_1" "enabling or disabling IPv6 per site policy" 1
     run_check "3.1.2" "L1S"     "AUTO"   "Ensure wireless interfaces are not available" "audit_3_1_2" "fix_3_1_2" "disabling wireless kernel modules"
     run_check "3.1.3" "L1S,L2W" "AUTO"   "Ensure bluetooth services are not in use" "audit_pkg_removed bluez" "fix_3_1_3" "stopping bluetooth.service and removing bluez"
 
@@ -1147,6 +1226,104 @@ run_section_3() {
     run_check "3.3.2.6" "L1S,L1W" "AUTO" "Ensure net.ipv6.conf.default.accept_source_route is configured" "audit_sysctl net.ipv6.conf.default.accept_source_route 0" "fix_sysctl net.ipv6.conf.default.accept_source_route 0" "setting net.ipv6.conf.default.accept_source_route = 0"
     run_check "3.3.2.7" "L1S,L1W" "AUTO" "Ensure net.ipv6.conf.all.accept_ra is configured"            "audit_sysctl net.ipv6.conf.all.accept_ra 0"           "fix_sysctl net.ipv6.conf.all.accept_ra 0"           "setting net.ipv6.conf.all.accept_ra = 0"
     run_check "3.3.2.8" "L1S,L1W" "AUTO" "Ensure net.ipv6.conf.default.accept_ra is configured"        "audit_sysctl net.ipv6.conf.default.accept_ra 0"       "fix_sysctl net.ipv6.conf.default.accept_ra 0"       "setting net.ipv6.conf.default.accept_ra = 0"
+}
+
+# --- 3.1.1 — IPv6 status identification ----------------------------------------
+audit_3_1_1() {
+    local ipv6_status="enabled"
+    local details=""
+
+    # Check kernel module parameter
+    if [[ -f /sys/module/ipv6/parameters/disable ]]; then
+        local kparam
+        kparam="$(cat /sys/module/ipv6/parameters/disable 2>/dev/null)"
+        details="  Kernel parameter /sys/module/ipv6/parameters/disable = ${kparam}"
+        [[ "$kparam" != "0" ]] && ipv6_status="disabled (kernel module)"
+    else
+        details="  IPv6 kernel module is not loaded"
+        ipv6_status="disabled (module not loaded)"
+    fi
+
+    # Check sysctl settings
+    local sysctl_all sysctl_def
+    sysctl_all="$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo "N/A")"
+    sysctl_def="$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null || echo "N/A")"
+    details="${details}\n  net.ipv6.conf.all.disable_ipv6 = ${sysctl_all}"
+    details="${details}\n  net.ipv6.conf.default.disable_ipv6 = ${sysctl_def}"
+
+    if [[ "$sysctl_all" == "1" && "$sysctl_def" == "1" ]]; then
+        ipv6_status="disabled (sysctl)"
+    fi
+
+    # Check GRUB kernel command line for ipv6.disable
+    local grub_ipv6=""
+    if command -v grubby &>/dev/null; then
+        grub_ipv6="$(grubby --info=DEFAULT 2>/dev/null | grep -Po 'ipv6\.disable=\K[0-9]+' || true)"
+        if [[ -n "$grub_ipv6" ]]; then
+            details="${details}\n  GRUB kernel cmdline: ipv6.disable=${grub_ipv6}"
+            [[ "$grub_ipv6" == "1" ]] && ipv6_status="disabled (GRUB cmdline)"
+        fi
+    fi
+
+    # Show interfaces with IPv6 addresses
+    local ipv6_addrs
+    ipv6_addrs="$(ip -6 addr show 2>/dev/null | grep -c 'inet6' || echo 0)"
+    details="${details}\n  Active IPv6 addresses on interfaces: ${ipv6_addrs}"
+
+    details="IPv6 status: ${ipv6_status}\n${details}"
+    CHECK_DETAIL="$(echo -e "$details")"
+
+    # This is a policy check — always "fail" so the user sees the status
+    # and is prompted to confirm it matches site policy
+    return 1
+}
+
+fix_3_1_1() {
+    local choice
+    echo ""
+    echo "  Current IPv6 status:"
+    echo -e "  $CHECK_DETAIL" | sed 's/^/  /'
+    echo ""
+    echo "  What would you like to do?"
+    echo "    1) Disable IPv6 (set sysctl + GRUB parameter)"
+    echo "    2) Enable IPv6  (ensure sysctl allows it)"
+    echo "    3) Leave as-is  (acknowledge current state)"
+    ask_input choice "Enter choice" "3"
+
+    case "$choice" in
+        1)
+            # Disable IPv6 via sysctl
+            sysctl -w net.ipv6.conf.all.disable_ipv6=1 2>/dev/null
+            sysctl -w net.ipv6.conf.default.disable_ipv6=1 2>/dev/null
+            {
+                echo "net.ipv6.conf.all.disable_ipv6 = 1"
+                echo "net.ipv6.conf.default.disable_ipv6 = 1"
+            } > /etc/sysctl.d/60-disable-ipv6.conf
+            # Disable via GRUB if available
+            if command -v grubby &>/dev/null; then
+                grubby --update-kernel=ALL --args="ipv6.disable=1" 2>/dev/null || true
+            fi
+            echo "  IPv6 has been disabled. A reboot is recommended for full effect."
+            ;;
+        2)
+            # Enable IPv6 via sysctl
+            sysctl -w net.ipv6.conf.all.disable_ipv6=0 2>/dev/null
+            sysctl -w net.ipv6.conf.default.disable_ipv6=0 2>/dev/null
+            rm -f /etc/sysctl.d/60-disable-ipv6.conf
+            sysctl --system &>/dev/null || true
+            # Remove GRUB disable if present
+            if command -v grubby &>/dev/null; then
+                grubby --update-kernel=ALL --remove-args="ipv6.disable" 2>/dev/null || true
+            fi
+            echo "  IPv6 has been enabled."
+            ;;
+        3|"")
+            echo "  Acknowledged — leaving IPv6 as-is."
+            ;;
+        *)
+            echo "  Invalid choice — leaving IPv6 as-is."
+            ;;
+    esac
 }
 
 audit_3_1_2() {
