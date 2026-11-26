@@ -3,8 +3,8 @@
 # CIS Oracle Linux 10 Benchmark v1.0.0 (09-29-2025) - Audit & Interactive Remediation
 #===============================================================================
 # Executes all 328 checks from the CIS Oracle Linux 10 Benchmark v1.0.0.
-# For every failed (or manual-review) check, prompts the user whether to
-# remediate and asks for any required configuration details.
+# For every failed (or manual-review/policy-choice) check, prompts the user
+# whether to remediate and asks for any required configuration details.
 #
 # Usage:
 #   sudo ./cis_ol10_audit_remediate.sh [OPTIONS]
@@ -42,6 +42,7 @@ CNT_FAIL=0
 CNT_FIXED=0
 CNT_FIX_FAIL=0
 CNT_MANUAL=0
+CNT_CHOICE=0
 CNT_SKIPPED=0
 CNT_NA=0
 
@@ -53,10 +54,13 @@ if [[ -t 1 ]]; then
     C_GREEN='\033[0;32m'
     C_YELLOW='\033[1;33m'
     C_CYAN='\033[0;36m'
+    C_BLUE='\033[1;34m'
     C_BOLD='\033[1m'
+    # Orange background (256-color 208) with black text
+    C_ORANGE_BG='\033[48;5;208;30m'
     C_RESET='\033[0m'
 else
-    C_RED='' C_GREEN='' C_YELLOW='' C_CYAN='' C_BOLD='' C_RESET=''
+    C_RED='' C_GREEN='' C_YELLOW='' C_CYAN='' C_BLUE='' C_BOLD='' C_ORANGE_BG='' C_RESET=''
 fi
 
 usage() {
@@ -153,8 +157,38 @@ should_run() {
     return 0
 }
 
+# Print a prominent warning on an orange background with black text.
+# Usage: critical_warning "<headline>" "<line1>" ["<line2>" ...]
+critical_warning() {
+    local headline="$1"; shift
+    printf "${C_ORANGE_BG} %s ${C_RESET}\n" "$headline"
+    local line
+    for line in "$@"; do
+        printf "${C_ORANGE_BG} %s ${C_RESET}\n" "$line"
+    done
+}
+
+# Print CHECK_DETAIL, indenting continuation lines under the "Details:" label.
+# Usage: print_detail <indent>
+print_detail() {
+    local indent="$1" line first=1
+    while IFS= read -r line; do
+        if [[ "$first" -eq 1 ]]; then
+            printf "%sDetails: %s\n" "$indent" "$line"
+            first=0
+        else
+            printf "%s       %s\n" "$indent" "$line"
+        fi
+    done <<< "$CHECK_DETAIL"
+}
+
 # Core runner for each CIS recommendation
-# Usage: run_check <id> <profiles> <AUTO|MANUAL> <title> <audit_fn> <rem_fn> <rem_desc> [needs_input:0|1]
+# Audit functions may return:
+#   0 = compliant (PASS)
+#   1 = non-compliant (FAIL)
+#   2 = not applicable (N/A)
+#   3 = policy choice (ctype CHOICE; shown in blue, no pass/fail verdict)
+# Usage: run_check <id> <profiles> <AUTO|MANUAL|CHOICE> <title> <audit_fn> <rem_fn> <rem_desc> [needs_input:0|1]
 run_check() {
     local id="$1" profiles="$2" ctype="$3" title="$4" audit_fn="$5" rem_fn="$6" rem_desc="$7" needs_input="${8:-0}"
 
@@ -172,7 +206,7 @@ run_check() {
         return 0
     elif [[ "$rc" -eq 2 ]]; then
         printf "${C_CYAN}[N/A]${C_RESET}  %s - %s\n" "$id" "$title"
-        [[ -n "$CHECK_DETAIL" ]] && printf "       Details: %s\n" "$CHECK_DETAIL"
+        [[ -n "$CHECK_DETAIL" ]] && print_detail "       "
         log_msg "[N/A] $id - $title | $CHECK_DETAIL"
         ((CNT_NA++))
         return 0
@@ -180,7 +214,7 @@ run_check() {
 
     if [[ "$ctype" == "MANUAL" && "$rem_fn" == "manual_only" ]]; then
         printf "${C_YELLOW}[MANUAL]${C_RESET} %s - %s\n" "$id" "$title"
-        [[ -n "$CHECK_DETAIL" ]] && printf "         Details: %s\n" "$CHECK_DETAIL"
+        [[ -n "$CHECK_DETAIL" ]] && print_detail "         "
         log_msg "[MANUAL] $id - $title | $CHECK_DETAIL"
         ((CNT_MANUAL++))
         if [[ "$AUDIT_ONLY" -eq 0 && "$SKIP_ALL" -eq 0 ]]; then
@@ -189,18 +223,40 @@ run_check() {
         return 0
     fi
 
-    printf "${C_RED}[FAIL]${C_RESET} %s - %s\n" "$id" "$title"
-    [[ -n "$CHECK_DETAIL" ]] && printf "       Details: %s\n" "$CHECK_DETAIL"
-    log_msg "[FAIL] $id - $title | $CHECK_DETAIL"
-    ((CNT_FAIL++))
+    local is_choice=0
+    if [[ "$ctype" == "CHOICE" ]]; then
+        # Policy decision (e.g. IPv6 enabled vs disabled): report it as a
+        # choice, not a failure, and let the operator pick the site policy.
+        is_choice=1
+        printf "${C_BLUE}[CHOICE]${C_RESET} %s - %s\n" "$id" "$title"
+        [[ -n "$CHECK_DETAIL" ]] && print_detail "         "
+        log_msg "[CHOICE] $id - $title | $CHECK_DETAIL"
+        ((CNT_CHOICE++))
+    else
+        printf "${C_RED}[FAIL]${C_RESET} %s - %s\n" "$id" "$title"
+        [[ -n "$CHECK_DETAIL" ]] && print_detail "       "
+        log_msg "[FAIL] $id - $title | $CHECK_DETAIL"
+        ((CNT_FAIL++))
+    fi
 
     if [[ "$AUDIT_ONLY" -eq 1 || "$SKIP_ALL" -eq 1 || "$rem_fn" == "manual_only" ]]; then
         [[ "$SKIP_ALL" -eq 1 ]] && ((CNT_SKIPPED++))
         return 0
     fi
 
+    if [[ "$id" == "1.4.1" ]]; then
+        critical_warning \
+            "CRITICAL WARNING: This action may prevent user login." \
+            "Setting the GRUB2 bootloader password will require it at every boot." \
+            "If the password is lost or entered incorrectly, the system may become unbootable." \
+            "Record the password securely before continuing."
+    fi
+
     local ans=""
-    if [[ "$AUTO_YES" -eq 1 && "$needs_input" -eq 0 ]]; then
+    if [[ "$is_choice" -eq 1 ]]; then
+        # The remediation function presents the policy menu itself.
+        ans="y"
+    elif [[ "$AUTO_YES" -eq 1 && "$needs_input" -eq 0 ]]; then
         ans="y"
     else
         read -r -p "Do you want to fix issue $id by $rem_desc? [Y/n/s(kip all)/q(uit)] " ans
@@ -220,6 +276,9 @@ run_check() {
                     printf "${C_GREEN}[FIXED]${C_RESET} %s remediated; check is now not applicable: %s\n" "$id" "$CHECK_DETAIL"
                     log_msg "[FIXED] $id | not applicable: $CHECK_DETAIL"
                     ((CNT_FIXED++))
+                elif [[ "$is_choice" -eq 1 ]]; then
+                    printf "${C_BLUE}[CHOICE]${C_RESET} %s policy choice recorded.\n" "$id"
+                    log_msg "[CHOICE_RECORDED] $id"
                 else
                     printf "${C_YELLOW}[WARN]${C_RESET} %s remediation ran, but re-audit still reports non-compliant: %s\n" "$id" "$CHECK_DETAIL"
                     log_msg "[FIX_INCOMPLETE] $id | $CHECK_DETAIL"
@@ -691,6 +750,7 @@ print_summary() {
     printf " Remediated & Verified  : %d\n" "$CNT_FIXED"
     printf " Remediation Incomplete : %d\n" "$CNT_FIX_FAIL"
     printf " Manual Review Needed   : %d\n" "$CNT_MANUAL"
+    printf " Policy Choices         : %d\n" "$CNT_CHOICE"
     printf " Not Applicable / Unavail: %d\n" "$CNT_NA"
     printf " Skipped                : %d\n" "$CNT_SKIPPED"
     printf " Log File               : %s\n" "$LOG_FILE"
@@ -1182,7 +1242,22 @@ fix_2_1_21() {
     fi
 }
 audit_2_1_22() {
-    CHECK_DETAIL="Listening sockets: $(ss -plntu 2>/dev/null | awk 'NR>1{print $5}' | paste -sd, -)"
+    local details
+    details="$(ss -plntu 2>/dev/null | awk '
+        NR > 1 {
+            svc = "unknown"
+            if (match($0, /users:\(\("[^"]+"/))
+                svc = substr($0, RSTART + 9, RLENGTH - 10)
+            key = $1 " " $5 " " svc
+            if (seen[key]++)
+                next
+            printf "  %s (%s/%s)\n", $5, svc, $1
+        }')"
+    if [[ -z "$details" ]]; then
+        CHECK_DETAIL="No listening services found."
+    else
+        CHECK_DETAIL="Listening services (address:port):"$'\n'"$details"
+    fi
     return 1
 }
 audit_2_3_2() {
@@ -1239,7 +1314,7 @@ fix_2_4_2_1() {
 run_section_3() {
     echo -e "\n${C_BOLD}=== Section 3: Network ===${C_RESET}"
 
-    run_check "3.1.1" "L1S,L1W" "MANUAL" "Ensure IPv6 status is identified" "audit_3_1_1" "fix_3_1_1" "enabling or disabling IPv6 per site policy" 1
+    run_check "3.1.1" "L1S,L1W" "CHOICE" "Ensure IPv6 status is identified" "audit_3_1_1" "fix_3_1_1" "enabling or disabling IPv6 per site policy" 1
     run_check "3.1.2" "L1S"     "AUTO"   "Ensure wireless interfaces are not available" "audit_3_1_2" "fix_3_1_2" "disabling wireless kernel modules"
     run_check "3.1.3" "L1S,L2W" "AUTO"   "Ensure bluetooth services are not in use" "audit_pkg_removed bluez" "fix_3_1_3" "stopping bluetooth.service and removing bluez"
 
@@ -1326,9 +1401,9 @@ audit_3_1_1() {
     details="IPv6 status: ${ipv6_status}\n${details}"
     CHECK_DETAIL="$(echo -e "$details")"
 
-    # This is a policy check — always "fail" so the user sees the status
-    # and is prompted to confirm it matches site policy
-    return 1
+    # This is a policy choice — return 3 so the runner shows [CHOICE] (blue)
+    # instead of [FAIL], then prompts for the site decision.
+    return 3
 }
 
 fix_3_1_1() {
@@ -1341,7 +1416,7 @@ fix_3_1_1() {
     echo "    1) Disable IPv6 (set sysctl + GRUB parameter)"
     echo "    2) Enable IPv6  (ensure sysctl allows it)"
     echo "    3) Leave as-is  (acknowledge current state)"
-    ask_input choice "Enter choice" "3"
+    ask_input "Enter choice" "3" choice
 
     case "$choice" in
         1)
@@ -1988,7 +2063,7 @@ run_section_6() {
     run_check "6.2.1.1"   "L1S,L1W" "AUTO"   "Ensure journald service is active" "audit_svc_active systemd-journald.service" "fix_svc_enable systemd-journald.service" "enabling and starting systemd-journald.service"
     run_check "6.2.1.2"   "L1S,L1W" "MANUAL" "Ensure journald log file access is configured" "manual_only" "manual_only" "Review journald tmpfiles.d permissions (/usr/lib/tmpfiles.d/systemd.conf)"
     run_check "6.2.1.3"   "L1S,L1W" "MANUAL" "Ensure journald log file rotation is configured" "audit_6_2_1_3" "fix_6_2_1_3" "configuring SystemMaxUse and MaxFileSec in /etc/systemd/journald.conf.d/60-cis.conf" 1
-    run_check "6.2.1.4"   "L1S,L1W" "AUTO"   "Ensure only one logging system is in use" "audit_6_2_1_4" "fix_6_2_1_4" "choosing between journald-only or rsyslog" 1
+    run_check "6.2.1.4"   "L1S,L1W" "CHOICE" "Ensure only one logging system is in use" "audit_6_2_1_4" "fix_6_2_1_4" "choosing between journald-only or rsyslog" 1
     run_check "6.2.2.1.1" "L1S,L1W" "AUTO"   "Ensure systemd-journal-remote is installed" "audit_pkg_installed systemd-journal-remote" "fix_pkg_installed systemd-journal-remote" "installing systemd-journal-remote"
     run_check "6.2.2.1.2" "L1S,L1W" "MANUAL" "Ensure systemd-journal-upload authentication is configured" "audit_6_2_2_1_2" "fix_6_2_2_1_2" "configuring URL and certificates in /etc/systemd/journal-upload.conf" 1
     run_check "6.2.2.1.3" "L1S,L1W" "AUTO"   "Ensure systemd-journal-upload is enabled and active" "audit_svc_enabled_active systemd-journal-upload.service" "fix_svc_enable systemd-journal-upload.service" "enabling systemd-journal-upload.service"
@@ -2152,21 +2227,39 @@ audit_6_2_1_4() {
     systemctl is-active systemd-journald.service >/dev/null 2>&1 && j_act=1
     systemctl is-active rsyslog.service >/dev/null 2>&1 && r_act=1
     if [[ "$j_act" -eq 1 && "$r_act" -eq 1 ]]; then
-        CHECK_DETAIL="Both systemd-journald and rsyslog are active (CIS recommends one primary logging system)."; return 1
+        CHECK_DETAIL="Both systemd-journald and rsyslog are active (CIS recommends one primary logging system)."; return 3
     elif [[ "$j_act" -eq 0 && "$r_act" -eq 0 ]]; then
-        CHECK_DETAIL="Neither systemd-journald nor rsyslog is active."; return 1
+        CHECK_DETAIL="Neither systemd-journald nor rsyslog is active."; return 3
     fi
     return 0
 }
 fix_6_2_1_4() {
     local choice=""
-    ask_input "Choose primary logging system (journald or rsyslog)" "journald" choice
-    if [[ "$choice" == "journald" ]]; then
-        systemctl disable --now rsyslog.service 2>/dev/null || true
-        fix_svc_enable systemd-journald.service
-    else
-        fix_svc_enable rsyslog.service
-    fi
+    echo ""
+    echo "  Current logging status:"
+    echo -e "  $CHECK_DETAIL" | sed 's/^/  /'
+    echo ""
+    echo "  Which primary logging system should be used?"
+    echo "    1) journald  (disable rsyslog, keep systemd-journald)"
+    echo "    2) rsyslog   (enable rsyslog)"
+    echo "    3) Leave as-is (acknowledge current state)"
+    ask_input "Enter choice" "3" choice
+
+    case "$choice" in
+        1)
+            systemctl disable --now rsyslog.service 2>/dev/null || true
+            fix_svc_enable systemd-journald.service
+            ;;
+        2)
+            fix_svc_enable rsyslog.service
+            ;;
+        3|"")
+            echo "  Acknowledged — leaving the logging configuration as-is."
+            ;;
+        *)
+            echo "  Invalid choice — leaving the logging configuration as-is."
+            ;;
+    esac
 }
 audit_6_2_2_1_2() {
     grep -Pqs '^\h*URL\h*=\h*\S+' /etc/systemd/journal-upload.conf 2>/dev/null || { CHECK_DETAIL="URL not set in /etc/systemd/journal-upload.conf"; return 1; }
