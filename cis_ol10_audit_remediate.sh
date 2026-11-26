@@ -17,6 +17,7 @@
 #   --audit-only                Audit only; do not prompt for remediation
 #   --auto-yes                  Auto-accept non-interactive remediations
 #   --log <file>                Custom log file path
+#   -v, --verbose               Log remediation output/errors and return codes
 #   -h, --help                  Show this help message
 #===============================================================================
 
@@ -31,6 +32,7 @@ FILTER_ID=""
 INCLUDE_WORKSTATION=0
 AUDIT_ONLY=0
 AUTO_YES=0
+VERBOSE=0
 SKIP_ALL=0
 LOG_FILE=""
 
@@ -58,7 +60,7 @@ else
 fi
 
 usage() {
-    sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
     exit 0
 }
 
@@ -70,6 +72,7 @@ while [[ $# -gt 0 ]]; do
         --include-workstation) INCLUDE_WORKSTATION=1; shift ;;
         --audit-only) AUDIT_ONLY=1; shift ;;
         --auto-yes) AUTO_YES=1; shift ;;
+        -v|--verbose) VERBOSE=1; shift ;;
         --log) LOG_FILE="${2:-}"; shift 2 ;;
         -h|--help) usage ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
@@ -86,6 +89,30 @@ fi
 
 log_msg() {
     printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE"
+}
+
+# Run a command, optionally teeing its stdout/stderr into the log file.
+# Usage: run_logged "<label>" <command> [args...]
+# When VERBOSE=1, command output is shown normally and also appended to the
+# log with start/end markers and the command's exit status.
+run_logged() {
+    local label="$1"; shift
+    local rc
+    if [[ "$VERBOSE" -eq 0 ]]; then
+        "$@"
+        return $?
+    fi
+    log_msg "[VERBOSE] START $label: $*"
+    "$@" > >(tee -a "$LOG_FILE") 2> >(tee -a "$LOG_FILE" >&2)
+    rc=$?
+    wait
+    # Keep log markers on their own line even if the command's last output
+    # (for example an interactive prompt) did not end with a newline.
+    if [[ -s "$LOG_FILE" && "$(tail -c 1 "$LOG_FILE" | wc -l)" -eq 0 ]]; then
+        printf '\n' >> "$LOG_FILE"
+    fi
+    log_msg "[VERBOSE] END $label (exit $rc)"
+    return "$rc"
 }
 
 # Prompt user for a value with optional default
@@ -181,13 +208,17 @@ run_check() {
 
     case "${ans,,}" in
         ""|y|yes)
-            if eval "$rem_fn"; then
+            if run_logged "remediation $id ($rem_fn)" eval "$rem_fn"; then
                 CHECK_DETAIL=""
                 local rrc=0
-                eval "$audit_fn" || rrc=$?
+                run_logged "re-audit $id ($audit_fn)" eval "$audit_fn" || rrc=$?
                 if [[ "$rrc" -eq 0 ]]; then
                     printf "${C_GREEN}[FIXED]${C_RESET} %s remediated and verified.\n" "$id"
                     log_msg "[FIXED] $id"
+                    ((CNT_FIXED++))
+                elif [[ "$rrc" -eq 2 ]]; then
+                    printf "${C_GREEN}[FIXED]${C_RESET} %s remediated; check is now not applicable: %s\n" "$id" "$CHECK_DETAIL"
+                    log_msg "[FIXED] $id | not applicable: $CHECK_DETAIL"
                     ((CNT_FIXED++))
                 else
                     printf "${C_YELLOW}[WARN]${C_RESET} %s remediation ran, but re-audit still reports non-compliant: %s\n" "$id" "$CHECK_DETAIL"
@@ -481,13 +512,28 @@ fix_svc_disabled() {
 audit_sysctl() {
     local key="$1" expected="$2"
     require_cmd sysctl || return $?
-    local cur
-    cur="$(sysctl -n "$key" 2>/dev/null || true)"
+    local cur rc
+    cur="$(sysctl -n "$key" 2>/dev/null)"
+    rc=$?
+    if [[ "$rc" -ne 0 || -z "$cur" ]]; then
+        # IPv6 parameters are not applicable when IPv6 is disabled on the system.
+        if [[ "$key" == net.ipv6.* ]]; then
+            local dis=""
+            dis="$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || true)"
+            if [[ "$dis" == "1" || ! -e "/proc/sys/${key//./\/}" ]]; then
+                CHECK_DETAIL="IPv6 is disabled on this system; $key is not available (not applicable)."
+                return 2
+            fi
+        fi
+        CHECK_DETAIL="sysctl $key is not available or returned no value."
+        return 1
+    fi
+    cur="${cur//$'\n'/ }"
     if [[ "$cur" != "$expected" ]]; then
         CHECK_DETAIL="sysctl $key is '$cur' (expected '$expected')."
         return 1
     fi
-    if ! grep -Prqs "^\h*${key//./\\.}\h*=\h*${expected}\b" /etc/sysctl.conf /etc/sysctl.d/*.conf /usr/lib/sysctl.d/*.conf 2>/dev/null; then
+    if ! grep -Prqs "^\h*${key//./\\.}\h*=\h*${expected}\b" /etc/sysctl.conf /etc/sysctl.d/*.conf /run/sysctl.d/*.conf /usr/local/lib/sysctl.d/*.conf /usr/lib/sysctl.d/*.conf /lib/sysctl.d/*.conf 2>/dev/null; then
         CHECK_DETAIL="sysctl $key=$expected is not persisted in sysctl configuration."
         return 1
     fi
@@ -742,7 +788,7 @@ run_section_1() {
     run_check "1.6.1" "L1S,L1W" "AUTO" "Ensure system wide crypto policy is not set to legacy" "audit_1_6_1" "fix_1_6_1" "setting system crypto policy to DEFAULT"
     run_check "1.6.2" "L1S,L1W" "AUTO" "Ensure system wide crypto policy disables sha1 hash and signature support" "audit_1_6_2" "fix_1_6_2" "enabling NO-SHA1 crypto subpolicy"
     run_check "1.6.3" "L1S,L1W" "AUTO" "Ensure system wide crypto policy macs are configured" "audit_1_6_3" "fix_1_6_3" "enabling NO-WEAKMAC crypto subpolicy"
-    run_check "1.6.4" "L1S,L1W" "AUTO" "Ensure system wide crypto policy disables cbc for ssh" "audit_1_6_4" "fix_1_6_4" "enabling NO-SSHCBC crypto subpolicy"
+    run_check "1.6.4" "L1S,L1W" "AUTO" "Ensure system wide crypto policy disables cbc for ssh" "audit_1_6_4" "fix_1_6_4" "enabling NO-SSHCBC and NO-CBC crypto subpolicies"
 
     # 1.7 Warning Banners
     run_check "1.7.1" "L1S,L1W" "AUTO" "Ensure /etc/motd is configured" "audit_banner /etc/motd" "fix_banner /etc/motd" "updating /etc/motd without OS info escapes" 1
@@ -914,14 +960,13 @@ audit_1_6_1() {
 fix_1_6_1() { update-crypto-policies --set DEFAULT; }
 
 apply_crypto_subpolicy() {
-    local sub="$1"
-    local cur
-    cur="$(cat /etc/crypto-policies/config 2>/dev/null || echo DEFAULT)"
-    if [[ "$cur" != *":$sub"* ]]; then
-        update-crypto-policies --set "${cur}:${sub}"
-    else
-        update-crypto-policies
-    fi
+    local cur sub
+    cur="$(tr -d '[:space:]' < /etc/crypto-policies/config 2>/dev/null || true)"
+    [[ -n "$cur" ]] || cur="DEFAULT"
+    for sub in "$@"; do
+        [[ "$cur" == *":$sub"* ]] || cur="${cur}:${sub}"
+    done
+    update-crypto-policies --set "$cur"
 }
 audit_1_6_2() {
     require_readable /etc/crypto-policies/state/CURRENT.pol || return $?
@@ -948,13 +993,21 @@ fix_1_6_3() {
 }
 audit_1_6_4() {
     require_readable /etc/crypto-policies/state/CURRENT.pol || return $?
-    grep -Pqi '^\h*cipher(@(lib|open)ssh(-server|-client)?)?\h*=\h*([^#\n\r]+)?-CBC\b' /etc/crypto-policies/state/CURRENT.pol 2>/dev/null && { CHECK_DETAIL="CBC ciphers enabled for SSH in crypto policy."; return 1; }
+    local out
+    out="$(grep -Pi '^\h*cipher(@(lib|open)ssh(-server|-client)?|@SSH)?\h*=\h*([^#\n\r]+)?-CBC\b' /etc/crypto-policies/state/CURRENT.pol 2>/dev/null || true)"
+    if [[ -n "$out" ]]; then
+        CHECK_DETAIL="CBC ciphers enabled in crypto policy: $(tr '\n' ' ' <<< "$out")"
+        return 1
+    fi
     return 0
 }
 fix_1_6_4() {
     mkdir -p /etc/crypto-policies/policies/modules
     printf '# Disable CBC for SSH\ncipher@SSH = -*-CBC\n' > /etc/crypto-policies/policies/modules/NO-SSHCBC.pmod
-    apply_crypto_subpolicy "NO-SSHCBC"
+    # The CIS audit also checks the unscoped "cipher" line, so CBC must be
+    # removed system-wide in addition to the SSH-specific scope.
+    printf '# Disable CBC system-wide (CIS 1.6.4 audit)\ncipher = -*-CBC\n' > /etc/crypto-policies/policies/modules/NO-CBC.pmod
+    apply_crypto_subpolicy "NO-SSHCBC" "NO-CBC"
 }
 
 audit_banner() {
@@ -1818,12 +1871,48 @@ fix_5_4_2_4() {
     fi
 }
 audit_5_4_2_5() {
-    local p
-    for p in $(echo "$PATH" | tr ':' ' '); do
-        if [[ -z "$p" || "$p" == "." || ! -d "$p" ]]; then
-            CHECK_DETAIL="Invalid/empty/dot entry in root PATH: '$p'"; return 1
+    local root_path="" p mode owner pmask="0022"
+    local -a entries=() reasons=()
+    # Use root's login environment, not the PATH inherited by this script.
+    if [[ "$EUID" -eq 0 ]] && command -v sudo >/dev/null 2>&1; then
+        root_path="$(sudo -n -Hiu root env 2>/dev/null | awk -F= '/^PATH=/{sub(/^PATH=/,"");print;exit}')"
+    fi
+    if [[ -z "$root_path" ]]; then
+        # Fall back to the standard secure PATH when sudo is unavailable.
+        root_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    fi
+    if [[ -z "$root_path" ]]; then
+        CHECK_DETAIL="Unable to determine root's PATH."
+        return 2
+    fi
+
+    grep -q '::' <<< "$root_path" && reasons+=("root's PATH contains an empty directory (::)")
+    [[ "$root_path" == *: ]] && reasons+=("root's PATH contains a trailing (:)")
+    grep -Pq '(^|:)\.(:|$)' <<< "$root_path" && reasons+=("root's PATH contains the current working directory (.)")
+
+    IFS=':' read -r -a entries <<< "$root_path"
+    for p in "${entries[@]}"; do
+        [[ -z "$p" ]] && continue
+        if [[ ! -d "$p" ]]; then
+            reasons+=("\"$p\" is not a directory")
+            continue
+        fi
+        read -r mode owner <<< "$(stat -Lc '%#a %U' "$p" 2>/dev/null || true)"
+        if [[ -z "$owner" ]]; then
+            reasons+=("Unable to stat \"$p\"")
+            continue
+        fi
+        [[ "$owner" == "root" ]] || reasons+=("Directory \"$p\" is owned by \"$owner\" (should be root)")
+        if [[ -n "$mode" ]] && (( (8#$mode & 8#$pmask) != 0 )); then
+            reasons+=("Directory \"$p\" is mode \"$mode\" (should be 0755 or more restrictive)")
         fi
     done
+
+    if [[ ${#reasons[@]} -gt 0 ]]; then
+        local IFS='; '
+        CHECK_DETAIL="${reasons[*]}"
+        return 1
+    fi
     return 0
 }
 audit_5_4_2_6() {
@@ -1848,7 +1937,7 @@ fix_5_4_2_7() {
 }
 audit_5_4_2_8() {
     require_readable /etc/shadow || return $?
-    local bad u
+    local bad="" u
     while IFS= read -r u; do
         if passwd -S "$u" 2>/dev/null | awk '$2 !~ /^L/' | grep -q .; then
             bad+="$u "
@@ -2421,6 +2510,9 @@ main() {
     fi
 
     log_msg "=== Starting CIS OL10 Benchmark Run (level=$FILTER_LEVEL section=$FILTER_SECTION id=$FILTER_ID) ==="
+    if [[ "$VERBOSE" -eq 1 ]]; then
+        log_msg "[VERBOSE] Verbose mode enabled: remediation output/errors and exit codes will be logged."
+    fi
 
     run_section_1
     run_section_2
