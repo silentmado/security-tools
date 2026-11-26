@@ -35,6 +35,10 @@ AUTO_YES=0
 VERBOSE=0
 SKIP_ALL=0
 LOG_FILE=""
+# Primary logging system selected at 6.2.1.4 (journald or rsyslog).
+# The CIS 6.2.2 (journald) and 6.2.3 (rsyslog) subsections are mutually
+# exclusive, so checks for the unused one are reported as N/A.
+LOG_SYSTEM=""
 
 CNT_TOTAL=0
 CNT_PASS=0
@@ -157,6 +161,27 @@ should_run() {
     return 0
 }
 
+# The CIS guide says to apply either the Configure journald (6.2.2) or the
+# Configure rsyslog (6.2.3) subsection, never both. Once the primary logging
+# system is known, skip the checks belonging to the other subsection rather
+# than reporting them as failures.
+# Sets CHECK_DETAIL and returns 0 when the check does not apply.
+logging_check_skipped() {
+    local id="$1"
+    [[ -n "$LOG_SYSTEM" ]] || return 1
+    case "$LOG_SYSTEM:$id" in
+        journald:6.2.3.*)
+            CHECK_DETAIL="Not applicable: journald is the selected logging system; rsyslog configuration checks (6.2.3.x) do not apply."
+            return 0
+            ;;
+        rsyslog:6.2.2.*)
+            CHECK_DETAIL="Not applicable: rsyslog is the selected logging system; journald configuration checks (6.2.2.x) do not apply."
+            return 0
+            ;;
+    esac
+    return 1
+}
+
 # Print a prominent warning on an orange background with black text.
 # Usage: critical_warning "<headline>" "<line1>" ["<line2>" ...]
 critical_warning() {
@@ -194,6 +219,16 @@ run_check() {
 
     should_run "$id" "$profiles" || return 0
     ((CNT_TOTAL++))
+
+    # Skip the subsection for the logging system that is not in use.
+    if logging_check_skipped "$id"; then
+        printf "${C_CYAN}[N/A]${C_RESET}  %s - %s\n" "$id" "$title"
+        print_detail "       "
+        log_msg "[N/A] $id - $title | $CHECK_DETAIL"
+        ((CNT_NA++))
+        return 0
+    fi
+
     CHECK_DETAIL=""
 
     local rc=0
@@ -703,6 +738,17 @@ fix_auditd_conf() {
     systemctl restart auditd 2>/dev/null || service auditd restart 2>/dev/null || true
 }
 
+# Run a command with a hard timeout so a wedged auditctl/augenrules cannot
+# leave the whole remediation loop hanging forever.
+run_with_timeout() {
+    local secs="$1"; shift
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$secs" "$@"
+    else
+        "$@"
+    fi
+}
+
 audit_auditd_rule() {
     local pat="$1"
     local files=(/etc/audit/rules.d/*.rules)
@@ -714,7 +760,7 @@ audit_auditd_rule() {
         return 1
     fi
     if [[ "$EUID" -eq 0 ]] && command -v auditctl >/dev/null 2>&1; then
-        if ! auditctl -l 2>/dev/null | grep -Pqs -- "$pat"; then
+        if ! run_with_timeout 10 auditctl -l 2>/dev/null | grep -Pqs -- "$pat"; then
             CHECK_DETAIL="Audit rule matching '$pat' not loaded in active auditctl -l."
             return 1
         fi
@@ -722,14 +768,62 @@ audit_auditd_rule() {
     return 0
 }
 
+# CIS 6.3.3.35 (-c) and 6.3.3.36 (-e 2) are loader directives, not rules.
+# auditctl -l lists kernel rules and never prints them, so validating these
+# checks against the running configuration always fails and sends the script
+# back into remediation on every pass. The CIS audit is file-based.
+audit_auditd_flag() {
+    local pat="$1"
+    local files=(/etc/audit/rules.d/*.rules)
+    require_readable /etc/audit/rules.d || return $?
+    if [[ "${#files[@]}" -eq 0 ]] || ! grep -Prqs -- "$pat" "${files[@]}" 2>/dev/null; then
+        CHECK_DETAIL="Audit directive matching '$pat' not found in /etc/audit/rules.d/."
+        return 1
+    fi
+    return 0
+}
+
+# Older versions of this script used "grep -Fxq \"$line\"" where $line starts
+# with '-' (e.g. -c, -a ...). GNU grep parsed it as an option, never found the
+# line, and appended another copy on every run. Remove those duplicates while
+# preserving file order and any comments/blank lines.
+dedupe_rule_file() {
+    local f="$1" tmp
+    [[ -f "$f" ]] || return 0
+    tmp="$(mktemp "${f}.XXXXXX" 2>/dev/null)" || return 0
+    if awk 'NF && seen[$0]++ {next} {print}' "$f" > "$tmp"; then
+        cat "$tmp" > "$f"
+    fi
+    rm -f "$tmp"
+}
+
+# Reload merged audit rules, but do not wait forever and do not attempt a
+# runtime change when the running configuration is already immutable (-e 2).
+reload_audit_rules() {
+    command -v augenrules >/dev/null 2>&1 || return 0
+    if command -v auditctl >/dev/null 2>&1 &&
+       run_with_timeout 10 auditctl -s 2>/dev/null | grep -Eq '^enabled[[:space:]]+2$'; then
+        printf '       Note: audit rules are immutable (enabled 2); changes apply after reboot.\n'
+        log_msg "[NOTE] Audit rules are immutable (enabled 2); reload skipped until reboot."
+        return 0
+    fi
+    run_with_timeout 30 augenrules --load >/dev/null 2>&1 || true
+}
+
 fix_auditd_rule() {
     local rfile="$1"; shift
     mkdir -p /etc/audit/rules.d
-    local line
+    local line added=0
+    dedupe_rule_file "$rfile"
     for line in "$@"; do
-        grep -Fxq "$line" "$rfile" 2>/dev/null || printf '%s\n' "$line" >> "$rfile"
+        # "--" stops grep from reading "-c"/"-a ..." as options.
+        if ! grep -Fxq -- "$line" "$rfile" 2>/dev/null; then
+            printf '%s\n' "$line" >> "$rfile"
+            added=1
+        fi
     done
-    augenrules --load >/dev/null 2>&1 || true
+    [[ "$added" -eq 1 ]] && reload_audit_rules
+    return 0
 }
 
 # --- pwquality / faillock / login.defs Helpers --------------------------------
@@ -1560,10 +1654,22 @@ audit_4_1_4() {
     return 0
 }
 fix_4_1_4() {
-    local z tgt=""
+    local z tgt="" choice
     while IFS= read -r z; do
         [[ -z "$z" ]] && continue
-        ask_input "Enter target for firewalld zone '$z' (DROP, REJECT, or default)" "DROP" tgt
+        # A zone *target* is DROP/REJECT/default - not a zone name such as
+        # "trusted". Validate before handing the value to firewall-cmd so a
+        # typo produces a useful prompt instead of INVALID_TARGET.
+        while :; do
+            ask_input "Enter target for firewalld zone '$z' (DROP, REJECT, or default)" "DROP" tgt
+            choice="${tgt,,}"
+            case "$choice" in
+                drop)    tgt="DROP"; break ;;
+                reject)  tgt="REJECT"; break ;;
+                default) tgt="default"; break ;;
+                *) printf "       Invalid target '%s'. Expected DROP, REJECT, or default.\n" "$tgt" ;;
+            esac
+        done
         firewall-cmd --permanent --zone="$z" --set-target="$tgt" || return 1
     done < <(active_firewall_zones)
     firewall-cmd --reload
@@ -2135,9 +2241,11 @@ run_section_6() {
 
     # 6.3.3 Auditd Rules
     run_check "6.3.3.1"  "L2S,L2W" "AUTO" "Ensure modification of the /etc/sudoers file is collected" "audit_auditd_rule 'path=/etc/sudoers.*key=scope'" "fix_auditd_rule /etc/audit/rules.d/50-scope.rules '-a always,exit -F arch=b64 -S all -F path=/etc/sudoers -F perm=wa -F key=scope' '-a always,exit -F arch=b64 -S all -F dir=/etc/sudoers.d -F perm=wa -F key=scope'" "adding sudoers scope audit rules"
-    # auditctl -l may list the syscall before the -C comparison, so accept
-    # either field order when verifying the active rule.
-    run_check "6.3.3.2"  "L2S,L2W" "AUTO" "Ensure actions as another user are always logged" "audit_auditd_rule '(euid!=uid.*execve.*user_emulation|execve.*euid!=uid.*user_emulation)'" "fix_auditd_rule /etc/audit/rules.d/50-user_emulation.rules '-a always,exit -F arch=b64 -C euid!=uid -F auid!=unset -S execve -k user_emulation'" "adding user_emulation audit rule"
+    # auditctl stores "-C euid!=uid" as UID_TO_EUID and lists it back as
+    # "-C uid!=euid"; it may also print the syscall before the comparison.
+    # Accept either operand order and either field order, otherwise the
+    # active rule loaded by the remediation is reported as missing.
+    run_check "6.3.3.2"  "L2S,L2W" "AUTO" "Ensure actions as another user are always logged" "audit_auditd_rule '\b(euid!=uid|uid!=euid)\b.*execve.*user_emulation|execve.*\b(euid!=uid|uid!=euid)\b.*user_emulation'" "fix_auditd_rule /etc/audit/rules.d/50-user_emulation.rules '-a always,exit -F arch=b64 -C euid!=uid -F auid!=unset -S execve -k user_emulation'" "adding user_emulation audit rule"
     run_check "6.3.3.3"  "L2S,L2W" "AUTO" "Ensure events that modify the sudo log file are collected" "audit_auditd_rule 'key=sudo_log_file'" "fix_6_3_3_3" "adding sudo log file audit rule"
     run_check "6.3.3.4"  "L2S,L2W" "AUTO" "Ensure events that modify date and time information are collected" "audit_auditd_rule 'time-change'" "fix_auditd_rule /etc/audit/rules.d/50-time-change.rules '-a always,exit -F arch=b64 -S adjtimex,settimeofday -k time-change' '-a always,exit -F arch=b64 -S clock_settime -F a0=0x0 -k time-change' '-a always,exit -F arch=b64 -S all -F path=/etc/localtime -F perm=wa -F key=time-change'" "adding time-change audit rules"
     run_check "6.3.3.5"  "L2S,L2W" "AUTO" "Ensure events that modify sethostname and setdomainname are collected" "audit_auditd_rule 'sethostname,setdomainname.*system-locale'" "fix_auditd_rule /etc/audit/rules.d/50-system_locale.rules '-a always,exit -F arch=b64 -S sethostname,setdomainname -k system-locale'" "adding sethostname/setdomainname audit rule"
@@ -2170,8 +2278,8 @@ run_section_6() {
     run_check "6.3.3.32" "L2S,L2W" "AUTO" "Ensure kernel init_module and finit_module loading unloading and modification is collected" "audit_auditd_rule 'init_module,finit_module.*kernel_modules'" "fix_auditd_rule /etc/audit/rules.d/50-kernel_modules.rules '-a always,exit -F arch=b64 -S init_module,finit_module -F auid>=1000 -F auid!=unset -k kernel_modules'" "adding init_module/finit_module audit rule"
     run_check "6.3.3.33" "L2S,L2W" "AUTO" "Ensure kernel delete_module loading unloading and modification is collected" "audit_auditd_rule 'delete_module.*kernel_modules'" "fix_auditd_rule /etc/audit/rules.d/50-kernel_modules.rules '-a always,exit -F arch=b64 -S delete_module -F auid>=1000 -F auid!=unset -k kernel_modules'" "adding delete_module audit rule"
     run_check "6.3.3.34" "L2S,L2W" "AUTO" "Ensure kernel query_module loading unloading and modification is collected" "audit_auditd_rule 'query_module.*kernel_modules'" "fix_auditd_rule /etc/audit/rules.d/50-kernel_modules.rules '-a always,exit -F arch=b64 -S query_module -F auid>=1000 -F auid!=unset -k kernel_modules'" "adding query_module audit rule"
-    run_check "6.3.3.35" "L2S,L2W" "AUTO" "Ensure the audit configuration is loaded regardless of errors" "audit_auditd_rule '^\h*-c\b'" "fix_auditd_rule /etc/audit/rules.d/01-initialize.rules '-c'" "adding -c to /etc/audit/rules.d/01-initialize.rules"
-    run_check "6.3.3.36" "L2S,L2W" "AUTO" "Ensure the audit configuration is immutable" "audit_auditd_rule '^\h*-e\h+2\b'" "fix_auditd_rule /etc/audit/rules.d/99-finalize.rules '-e 2'" "adding -e 2 to /etc/audit/rules.d/99-finalize.rules"
+    run_check "6.3.3.35" "L2S,L2W" "AUTO" "Ensure the audit configuration is loaded regardless of errors" "audit_auditd_flag '^\h*-c\b'" "fix_auditd_rule /etc/audit/rules.d/01-initialize.rules '-c'" "adding -c to /etc/audit/rules.d/01-initialize.rules"
+    run_check "6.3.3.36" "L2S,L2W" "AUTO" "Ensure the audit configuration is immutable" "audit_auditd_flag '^\h*-e\h+2\b'" "fix_auditd_rule /etc/audit/rules.d/99-finalize.rules '-e 2'" "adding -e 2 to /etc/audit/rules.d/99-finalize.rules"
     run_check "6.3.3.37" "L2S,L2W" "MANUAL" "Ensure the running and on disk configuration is the same" "audit_6_3_3_37" "fix_6_3_3_37" "running augenrules --load"
 
     # 6.3.4 Auditd File Access
@@ -2265,6 +2373,17 @@ fix_6_2_1_3() {
     fix_journald "SystemMaxUse" "$mu"
     fix_journald "MaxFileSec" "$ms"
 }
+# Remember the logging system already in use when the system complies
+# (exactly one service active). An explicit choice in fix_6_2_1_4 wins.
+record_active_logging_system() {
+    [[ -n "$LOG_SYSTEM" ]] && return 0
+    local j=0 r=0
+    systemctl is-active systemd-journald.service >/dev/null 2>&1 && j=1
+    systemctl is-active rsyslog.service >/dev/null 2>&1 && r=1
+    [[ "$j" -eq 1 && "$r" -eq 0 ]] && LOG_SYSTEM="journald"
+    [[ "$j" -eq 0 && "$r" -eq 1 ]] && LOG_SYSTEM="rsyslog"
+    return 0
+}
 audit_6_2_1_4() {
     local j_act=0 r_act=0
     systemctl is-active systemd-journald.service >/dev/null 2>&1 && j_act=1
@@ -2274,6 +2393,7 @@ audit_6_2_1_4() {
     elif [[ "$j_act" -eq 0 && "$r_act" -eq 0 ]]; then
         CHECK_DETAIL="Neither systemd-journald nor rsyslog is active."; return 3
     fi
+    record_active_logging_system
     return 0
 }
 fix_6_2_1_4() {
@@ -2290,14 +2410,17 @@ fix_6_2_1_4() {
 
     case "$choice" in
         1)
+            LOG_SYSTEM="journald"
             systemctl disable --now rsyslog.service 2>/dev/null || true
             fix_svc_enable systemd-journald.service
             ;;
         2)
+            LOG_SYSTEM="rsyslog"
             fix_svc_enable rsyslog.service
             ;;
         3|"")
             echo "  Acknowledged — leaving the logging configuration as-is."
+            record_active_logging_system
             ;;
         *)
             echo "  Invalid choice — leaving the logging configuration as-is."
@@ -2413,18 +2536,18 @@ fix_6_3_3_10() {
         find "$part" -xdev -perm /6000 -type f 2>/dev/null | awk -v u="$uid_min" '{print "-a always,exit -F arch=b64 -S all -F path="$1" -F perm=x -F auid>="u" -F auid!=unset -k privileged"}' >> /etc/audit/rules.d/50-privileged.rules
     done
     sort -u -o /etc/audit/rules.d/50-privileged.rules /etc/audit/rules.d/50-privileged.rules
-    augenrules --load >/dev/null 2>&1 || true
+    reload_audit_rules
 }
 audit_6_3_3_37() {
     require_cmd augenrules || return $?
     require_root || return $?
-    if augenrules --check 2>&1 | grep -q "No change"; then
+    if run_with_timeout 15 augenrules --check 2>&1 | grep -q "No change"; then
         return 0
     fi
     CHECK_DETAIL="Running auditd rules differ from on-disk /etc/audit/rules.d/."
     return 1
 }
-fix_6_3_3_37() { augenrules --load; }
+fix_6_3_3_37() { reload_audit_rules; }
 
 audit_6_3_4_dir() {
     local d
@@ -2519,7 +2642,7 @@ run_section_7() {
 
     run_check "7.1.11" "L1S,L1W" "AUTO"   "Ensure world writable files and directories are secured" "audit_7_1_11" "fix_7_1_11" "removing world-write on files and setting sticky bit on world-writable dirs"
     run_check "7.1.12" "L1S,L1W" "AUTO"   "Ensure no files or directories without an owner and a group exist" "audit_7_1_12" "fix_7_1_12" "assigning owner/group to unowned files" 1
-    run_check "7.1.13" "L1S,L1W" "MANUAL" "Ensure SUID and SGID files are reviewed" "manual_only" "manual_only" "Review SUID/SGID files via 'find / -xdev -type f \\( -perm -4000 -o -perm -2000 \\)'"
+    run_check "7.1.13" "L1S,L1W" "MANUAL" "Ensure SUID and SGID files are reviewed" "audit_7_1_13" "manual_only" "Review the listed SUID/SGID files and verify their integrity against the package checksums"
 
     # 7.2 Local User and Group Settings
     run_check "7.2.1" "L1S,L1W" "AUTO" "Ensure accounts in /etc/passwd use shadowed passwords" "audit_7_2_1" "fix_7_2_1" "running pwconv"
@@ -2554,6 +2677,52 @@ fix_7_1_12() {
     ask_input "Enter owner:group to assign to unowned files" "root:root" owner
     find / -xdev \( -nouser -o -nogroup \) ! -path '/proc/*' ! -path '/sys/*' -exec chown "$owner" {} + 2>/dev/null || true
 }
+
+# CIS 7.1.13 is a manual review control. Build the SUID/SGID inventory the
+# benchmark asks for and print one file path per line for review. As in the
+# benchmark audit, scan local filesystems but skip virtual/network mounts and
+# mounts that are noexec/nosuid. Overlapping mounts are de-duplicated.
+audit_7_1_13() {
+    local mount l_file l_mode
+    local -a a_suid=() a_sgid=()
+    local -A seen_suid=() seen_sgid=()
+
+    while IFS= read -r mount; do
+        [[ -n "$mount" ]] || continue
+        while IFS= read -r -d '' l_file; do
+            l_mode="$(stat -Lc '%a' "$l_file" 2>/dev/null)" || continue
+            if [[ $(( 8#$l_mode & 04000 )) -ne 0 && -z "${seen_suid["$l_file"]:-}" ]]; then
+                a_suid+=("$l_file")
+                seen_suid["$l_file"]=1
+            fi
+            if [[ $(( 8#$l_mode & 02000 )) -ne 0 && -z "${seen_sgid["$l_file"]:-}" ]]; then
+                a_sgid+=("$l_file")
+                seen_sgid["$l_file"]=1
+            fi
+        done < <(find "$mount" -xdev -type f \( -perm -2000 -o -perm -4000 \) -print0 2>/dev/null)
+    done < <(findmnt -Dkerno fstype,target,options | awk '($1 !~ /^\s*(nfs|proc|smb|vfat|iso9660|efivarfs|selinuxfs)/ && $2 !~ /^\/run\/user\// && $3 !~/noexec/ && $3 !~/nosuid/) {print $2}' 2>/dev/null)
+
+    if (( ${#a_suid[@]} == 0 && ${#a_sgid[@]} == 0 )); then
+        CHECK_DETAIL="No SUID or SGID files found on scanned filesystems"
+        return 0
+    fi
+
+    # One path per line keeps the list readable in the terminal and the log.
+    CHECK_DETAIL="SUID files (${#a_suid[@]}):"
+    if (( ${#a_suid[@]} > 0 )); then
+        CHECK_DETAIL+=$'\n'"$(printf '%s\n' "${a_suid[@]}")"
+    else
+        CHECK_DETAIL+=$'\n'"(none)"
+    fi
+    CHECK_DETAIL+=$'\n'"SGID files (${#a_sgid[@]}):"
+    if (( ${#a_sgid[@]} > 0 )); then
+        CHECK_DETAIL+=$'\n'"$(printf '%s\n' "${a_sgid[@]}")"
+    else
+        CHECK_DETAIL+=$'\n'"(none)"
+    fi
+    return 1
+}
+
 audit_7_2_1() {
     local bad
     bad="$(awk -F: '($2 != "x"){print $1}' /etc/passwd)"
