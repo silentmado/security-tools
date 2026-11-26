@@ -60,11 +60,9 @@ if [[ -t 1 ]]; then
     C_CYAN='\033[0;36m'
     C_BLUE='\033[1;34m'
     C_BOLD='\033[1m'
-    # Orange background (256-color 208) with black text
-    C_ORANGE_BG='\033[48;5;208;30m'
     C_RESET='\033[0m'
 else
-    C_RED='' C_GREEN='' C_YELLOW='' C_CYAN='' C_BLUE='' C_BOLD='' C_ORANGE_BG='' C_RESET=''
+    C_RED='' C_GREEN='' C_YELLOW='' C_CYAN='' C_BLUE='' C_BOLD='' C_RESET=''
 fi
 
 usage() {
@@ -182,17 +180,6 @@ logging_check_skipped() {
     return 1
 }
 
-# Print a prominent warning on an orange background with black text.
-# Usage: critical_warning "<headline>" "<line1>" ["<line2>" ...]
-critical_warning() {
-    local headline="$1"; shift
-    printf "${C_ORANGE_BG} %s ${C_RESET}\n" "$headline"
-    local line
-    for line in "$@"; do
-        printf "${C_ORANGE_BG} %s ${C_RESET}\n" "$line"
-    done
-}
-
 # Print CHECK_DETAIL, indenting continuation lines under the "Details:" label.
 # Usage: print_detail <indent>
 print_detail() {
@@ -277,14 +264,6 @@ run_check() {
     if [[ "$AUDIT_ONLY" -eq 1 || "$SKIP_ALL" -eq 1 || "$rem_fn" == "manual_only" ]]; then
         [[ "$SKIP_ALL" -eq 1 ]] && ((CNT_SKIPPED++))
         return 0
-    fi
-
-    if [[ "$id" == "1.4.1" ]]; then
-        critical_warning \
-            "CRITICAL WARNING: This action may prevent user login." \
-            "Setting the GRUB2 bootloader password will require it at every boot." \
-            "If the password is lost or entered incorrectly, the system may become unbootable." \
-            "Record the password securely before continuing."
     fi
 
     local ans=""
@@ -1628,26 +1607,61 @@ fix_4_1_3() {
     systemctl unmask firewalld.service 2>/dev/null || true
     systemctl --now enable firewalld.service
 }
-# Print the names of currently active firewalld zones, one per line.
-# --get-active-zones marks the default zone as "public (default)"; the suffix
-# is not part of the zone name and must be removed before calling firewall-cmd.
+# Print the names of active firewalld zones that are subject to 4.1.4, one per
+# line. --get-active-zones marks the default zone as "public (default)"; only
+# the first token is the zone name. Zones whose interfaces are only loopback
+# or virtual devices (for example "trusted" on lo) are intentionally skipped:
+# CIS 4.1.4 applies to real interfaces, while 4.1.5/4.1.6 configure the
+# loopback zone separately. A zone active only through sources is kept.
 active_firewall_zones() {
-    firewall-cmd --get-active-zones 2>/dev/null | awk '
-        /^[[:space:]]/ { next }
-        { sub(/[[:space:]]+\(default\)[[:space:]]*$/, ""); if (length($0)) print }
-    '
+    local line zone="" iface has_iface=0 has_real=0 ifaces
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^[[:space:]] ]]; then
+            [[ "$line" =~ ^[[:space:]]*interfaces:[[:space:]]*(.*)$ ]] || continue
+            ifaces="${BASH_REMATCH[1]}"
+            [[ -n "${ifaces//[[:space:]]/}" ]] || continue
+            has_iface=1
+            for iface in $ifaces; do
+                case "$iface" in
+                    lo|virbr*) ;;
+                    *) has_real=1 ;;
+                esac
+            done
+        else
+            if [[ -n "$zone" ]] && { [[ "$has_iface" -eq 0 ]] || [[ "$has_real" -eq 1 ]]; }; then
+                printf '%s\n' "$zone"
+            fi
+            zone="${line%%[[:space:]]*}"
+            has_iface=0
+            has_real=0
+        fi
+    done < <(firewall-cmd --get-active-zones 2>/dev/null)
+    if [[ -n "$zone" ]] && { [[ "$has_iface" -eq 0 ]] || [[ "$has_real" -eq 1 ]]; }; then
+        printf '%s\n' "$zone"
+    fi
 }
 
 audit_4_1_4() {
     require_cmd firewall-cmd || return $?
     require_root || return $?
     systemctl is-active firewalld.service >/dev/null 2>&1 || { CHECK_DETAIL="firewalld is not active."; return 2; }
-    local z tgt
+    local z ptarget runtime_target
     while IFS= read -r z; do
         [[ -z "$z" ]] && continue
-        tgt="$(firewall-cmd --zone="$z" --get-target 2>/dev/null || true)"
-        if [[ ! "$tgt" =~ ^(DROP|REJECT|default)$ ]]; then
-            CHECK_DETAIL="Active zone '$z' has target '$tgt' (expected DROP, REJECT, or default)."
+        # --get-target is only accepted with --permanent on this firewalld
+        # version; the runtime target is reported by --list-all instead.
+        ptarget="$(firewall-cmd --permanent --zone="$z" --get-target 2>/dev/null || true)"
+        runtime_target="$(firewall-cmd --list-all --zone="$z" 2>/dev/null | awk -F: '
+            /^[[:space:]]*target:/ { gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit }
+        ')"
+        [[ -n "$ptarget" ]] || { CHECK_DETAIL="Active zone '$z' has no readable permanent target."; return 1; }
+        [[ -n "$runtime_target" ]] || { CHECK_DETAIL="Active zone '$z' has no readable runtime target."; return 1; }
+        if [[ "${ptarget,,}" != "${runtime_target,,}" ]]; then
+            CHECK_DETAIL="Active zone '$z' target '$runtime_target' is not a permanent firewall rule (permanent target: '$ptarget')."
+            return 1
+        fi
+        if [[ ! "$ptarget" =~ ^(DROP|REJECT|default)$ ]]; then
+            CHECK_DETAIL="Active zone '$z' has target '$ptarget' (expected DROP, REJECT, or default)."
             return 1
         fi
     done < <(active_firewall_zones)
@@ -2642,7 +2656,7 @@ run_section_7() {
 
     run_check "7.1.11" "L1S,L1W" "AUTO"   "Ensure world writable files and directories are secured" "audit_7_1_11" "fix_7_1_11" "removing world-write on files and setting sticky bit on world-writable dirs"
     run_check "7.1.12" "L1S,L1W" "AUTO"   "Ensure no files or directories without an owner and a group exist" "audit_7_1_12" "fix_7_1_12" "assigning owner/group to unowned files" 1
-    run_check "7.1.13" "L1S,L1W" "MANUAL" "Ensure SUID and SGID files are reviewed" "audit_7_1_13" "manual_only" "Review the listed SUID/SGID files and verify their integrity against the package checksums"
+    run_check "7.1.13" "L1S,L1W" "AUTO" "Ensure SUID and SGID files are reviewed" "audit_7_1_13" "manual_only" "Restore modified SUID/SGID binaries from their packages and remove rogue SUID/SGID files"
 
     # 7.2 Local User and Group Settings
     run_check "7.2.1" "L1S,L1W" "AUTO" "Ensure accounts in /etc/passwd use shadowed passwords" "audit_7_2_1" "fix_7_2_1" "running pwconv"
@@ -2678,48 +2692,95 @@ fix_7_1_12() {
     find / -xdev \( -nouser -o -nogroup \) ! -path '/proc/*' ! -path '/sys/*' -exec chown "$owner" {} + 2>/dev/null || true
 }
 
-# CIS 7.1.13 is a manual review control. Build the SUID/SGID inventory the
-# benchmark asks for and print one file path per line for review. As in the
-# benchmark audit, scan local filesystems but skip virtual/network mounts and
-# mounts that are noexec/nosuid. Overlapping mounts are de-duplicated.
-audit_7_1_13() {
-    local mount l_file l_mode
-    local -a a_suid=() a_sgid=()
-    local -A seen_suid=() seen_sgid=()
+# CIS 7.1.13 is automated: enumerate the SUID/SGID files the benchmark asks
+# for, then verify each one against the RPM database. A file fails if it is not
+# owned by a package (possible rogue binary) or if rpm -V reports a size, mode
+# or checksum mismatch. As in the benchmark audit, scan local filesystems but
+# skip virtual/network mounts and mounts that are noexec/nosuid. Overlapping
+# mounts are de-duplicated.
+# Emits one line per reviewed file: <file><TAB><status><TAB><package>, where
+# status is "ok" or the reason for failure.
+suid_sgid_review() {
+    local mount l_file l_mode pkg flags line path found
+    local -A seen=() pkg_cache=() verify_cache=()
 
     while IFS= read -r mount; do
         [[ -n "$mount" ]] || continue
         while IFS= read -r -d '' l_file; do
+            [[ -e "$l_file" ]] || continue
             l_mode="$(stat -Lc '%a' "$l_file" 2>/dev/null)" || continue
-            if [[ $(( 8#$l_mode & 04000 )) -ne 0 && -z "${seen_suid["$l_file"]:-}" ]]; then
-                a_suid+=("$l_file")
-                seen_suid["$l_file"]=1
+            [[ $(( 8#$l_mode & 06000 )) -ne 0 ]] || continue
+            [[ -z "${seen["$l_file"]:-}" ]] || continue
+            seen["$l_file"]=1
+
+            if [[ -z "${pkg_cache["$l_file"]+set}" ]]; then
+                pkg_cache["$l_file"]="$(rpm -qf --qf '%{NVRA}\n' "$l_file" 2>/dev/null)" || pkg_cache["$l_file"]=""
             fi
-            if [[ $(( 8#$l_mode & 02000 )) -ne 0 && -z "${seen_sgid["$l_file"]:-}" ]]; then
-                a_sgid+=("$l_file")
-                seen_sgid["$l_file"]=1
+            pkg="${pkg_cache["$l_file"]}"
+            pkg="${pkg%%$'\n'*}"
+            if [[ -z "$pkg" ]]; then
+                printf '%s\t%s\t%s\n' "$l_file" "not owned by an RPM package (possible rogue binary)" "-"
+                continue
+            fi
+
+            # rpm -V output is generated once per package and reused for all
+            # SUID/SGID files belonging to it.
+            if [[ -z "${verify_cache["$pkg"]+set}" ]]; then
+                verify_cache["$pkg"]="$(rpm -V "$pkg" 2>/dev/null)"
+            fi
+
+            flags=""
+            found=0
+            while IFS= read -r line; do
+                [[ -n "$line" ]] || continue
+                if [[ "$line" == missing[[:space:]]* ]]; then
+                    flags="missing"
+                    path="${line#missing}"
+                else
+                    flags="${line%%[[:space:]]*}"
+                    path="${line#"$flags"}"
+                    # Only size, mode and digest changes are integrity issues;
+                    # a timestamp-only change is normal and ignored.
+                    [[ "$flags" == *[SM5]* ]] || continue
+                fi
+                path="${path#"${path%%[![:space:]]*}"}"
+                if [[ "$path" =~ ^[cgld][[:space:]]+(.*)$ ]]; then
+                    path="${BASH_REMATCH[1]}"
+                fi
+                [[ "$path" == "$l_file" ]] || continue
+                found=1
+                break
+            done <<< "${verify_cache["$pkg"]}"
+
+            if [[ "$found" -eq 1 ]]; then
+                printf '%s\t%s\t%s\n' "$l_file" "differs from package metadata (rpm -V flags: $flags)" "$pkg"
+            else
+                printf '%s\t%s\t%s\n' "$l_file" "ok" "$pkg"
             fi
         done < <(find "$mount" -xdev -type f \( -perm -2000 -o -perm -4000 \) -print0 2>/dev/null)
     done < <(findmnt -Dkerno fstype,target,options | awk '($1 !~ /^\s*(nfs|proc|smb|vfat|iso9660|efivarfs|selinuxfs)/ && $2 !~ /^\/run\/user\// && $3 !~/noexec/ && $3 !~/nosuid/) {print $2}' 2>/dev/null)
+}
 
-    if (( ${#a_suid[@]} == 0 && ${#a_sgid[@]} == 0 )); then
-        CHECK_DETAIL="No SUID or SGID files found on scanned filesystems"
+audit_7_1_13() {
+    require_cmd rpm findmnt stat || return $?
+    local review file status pkg total=0 bad=0 issues=""
+
+    review="$(suid_sgid_review)"
+    while IFS=$'\t' read -r file status pkg; do
+        [[ -n "$file" ]] || continue
+        ((total++))
+        [[ "$status" == "ok" ]] && continue
+        ((bad++))
+        issues+=$'\n'"  $file: $status (package: $pkg)"
+    done <<< "$review"
+
+    if (( bad == 0 )); then
+        CHECK_DETAIL="Reviewed $total SUID/SGID file(s); all are package-owned and match package metadata"
         return 0
     fi
 
-    # One path per line keeps the list readable in the terminal and the log.
-    CHECK_DETAIL="SUID files (${#a_suid[@]}):"
-    if (( ${#a_suid[@]} > 0 )); then
-        CHECK_DETAIL+=$'\n'"$(printf '%s\n' "${a_suid[@]}")"
-    else
-        CHECK_DETAIL+=$'\n'"(none)"
-    fi
-    CHECK_DETAIL+=$'\n'"SGID files (${#a_sgid[@]}):"
-    if (( ${#a_sgid[@]} > 0 )); then
-        CHECK_DETAIL+=$'\n'"$(printf '%s\n' "${a_sgid[@]}")"
-    else
-        CHECK_DETAIL+=$'\n'"(none)"
-    fi
+    CHECK_DETAIL="$bad of $total SUID/SGID file(s) failed verification:${issues}"
+    CHECK_DETAIL+=$'\n'"Restore modified binaries from their packages (for example 'dnf reinstall <package>') and remove SUID/SGID bits from unowned files."
     return 1
 }
 
