@@ -623,6 +623,14 @@ audit_file_access() {
     local real_p mode u g
     real_p="$(readlink -e "$path" 2>/dev/null || echo "$path")"
     read -r mode u g <<< "$(stat -Lc '%#a %U %G' "$real_p" 2>/dev/null)"
+    # stat's %#a prints "0" for mode 0000 and drops leading zeros for modes
+    # such as 400. Normalize to four octal digits so the same mode regex can
+    # be used before and after remediation.
+    if [[ -z "$mode" ]]; then
+        CHECK_DETAIL="Cannot stat '$real_p'."
+        return 1
+    fi
+    mode="$(printf '%04o' "$((8#$mode))")"
     if [[ ! "$mode" =~ ^${mode_re}$ ]] || [[ "$u" != "$owner" ]] || [[ ! "$g" =~ ^${group_re}$ ]]; then
         CHECK_DETAIL="$path has mode=$mode owner=$u group=$g."
         return 1
@@ -662,11 +670,17 @@ audit_sshd_param() {
 
 fix_sshd_param() {
     local param="$1" value="$2"
-    local conf="/etc/ssh/sshd_config.d/60-cis.conf"
-    mkdir -p /etc/ssh/sshd_config.d
-    touch "$conf"
-    sed -ri "/^\s*${param}\s+/Id" "$conf" /etc/ssh/sshd_config 2>/dev/null || true
-    printf '%s %s\n' "$param" "$value" >> "$conf"
+    local dir="/etc/ssh/sshd_config.d" conf="/etc/ssh/sshd_config.d/00-cis.conf"
+    local f
+    mkdir -p "$dir"
+    # sshd uses the first occurrence of a keyword. Remove conflicting values
+    # from the main config and every drop-in, then set ours in a file that
+    # sorts before vendor drop-ins such as 50-redhat.conf.
+    for f in /etc/ssh/sshd_config "$dir"/*.conf; do
+        [[ -f "$f" ]] || continue
+        sed -ri "/^[[:space:]]*${param}[[:space:]]+/Id" "$f" 2>/dev/null || true
+    done
+    printf '%s %s\n' "$param" "$value" > "$conf"
     chmod 600 "$conf"
     systemctl reload-or-restart sshd 2>/dev/null || true
 }
@@ -691,13 +705,16 @@ fix_auditd_conf() {
 
 audit_auditd_rule() {
     local pat="$1"
+    local files=(/etc/audit/rules.d/*.rules)
     require_readable /etc/audit/rules.d || return $?
-    if ! grep -Prqs "$pat" /etc/audit/rules.d/*.rules 2>/dev/null; then
+    # "--" is required because some patterns (e.g. "-S mount...") start with
+    # a dash and would otherwise be parsed by grep as an option.
+    if [[ "${#files[@]}" -eq 0 ]] || ! grep -Prqs -- "$pat" "${files[@]}" 2>/dev/null; then
         CHECK_DETAIL="Audit rule matching '$pat' not found in /etc/audit/rules.d/."
         return 1
     fi
     if [[ "$EUID" -eq 0 ]] && command -v auditctl >/dev/null 2>&1; then
-        if ! auditctl -l 2>/dev/null | grep -Pqs "$pat"; then
+        if ! auditctl -l 2>/dev/null | grep -Pqs -- "$pat"; then
             CHECK_DETAIL="Audit rule matching '$pat' not loaded in active auditctl -l."
             return 1
         fi
@@ -1050,6 +1067,20 @@ fix_1_6_3() {
     mkdir -p /etc/crypto-policies/policies/modules
     printf '# Disable weak MACs\nmac = -*-128\n' > /etc/crypto-policies/policies/modules/NO-WEAKMAC.pmod
     apply_crypto_subpolicy "NO-WEAKMAC"
+}
+
+# CIS 5.1.15 rejects HMAC-SHA1/UMAC-64 for SSH, which the generic NO-WEAKMAC
+# subpolicy (128-bit only) does not cover. Apply the SSH-specific subpolicy
+# and restart sshd so it re-reads the generated crypto-policy back-end.
+fix_5_1_15() {
+    mkdir -p /etc/crypto-policies/policies/modules
+    printf '%s\n' \
+        '# Disable weak SSH MACs' \
+        'mac@SSH = -HMAC-MD5* -UMAC-64* -UMAC-128* -HMAC-SHA1*' \
+        > /etc/crypto-policies/policies/modules/NO-SSHWEAKMACS.pmod
+    apply_crypto_subpolicy "NO-SSHWEAKMACS"
+    systemctl reload-or-restart sshd.service >/dev/null 2>&1 || \
+        systemctl restart sshd.service >/dev/null 2>&1 || true
 }
 audit_1_6_4() {
     require_readable /etc/crypto-policies/state/CURRENT.pol || return $?
@@ -1503,6 +1534,16 @@ fix_4_1_3() {
     systemctl unmask firewalld.service 2>/dev/null || true
     systemctl --now enable firewalld.service
 }
+# Print the names of currently active firewalld zones, one per line.
+# --get-active-zones marks the default zone as "public (default)"; the suffix
+# is not part of the zone name and must be removed before calling firewall-cmd.
+active_firewall_zones() {
+    firewall-cmd --get-active-zones 2>/dev/null | awk '
+        /^[[:space:]]/ { next }
+        { sub(/[[:space:]]+\(default\)[[:space:]]*$/, ""); if (length($0)) print }
+    '
+}
+
 audit_4_1_4() {
     require_cmd firewall-cmd || return $?
     require_root || return $?
@@ -1515,7 +1556,7 @@ audit_4_1_4() {
             CHECK_DETAIL="Active zone '$z' has target '$tgt' (expected DROP, REJECT, or default)."
             return 1
         fi
-    done < <(firewall-cmd --get-active-zones 2>/dev/null | grep -v '^\s')
+    done < <(active_firewall_zones)
     return 0
 }
 fix_4_1_4() {
@@ -1523,8 +1564,8 @@ fix_4_1_4() {
     while IFS= read -r z; do
         [[ -z "$z" ]] && continue
         ask_input "Enter target for firewalld zone '$z' (DROP, REJECT, or default)" "DROP" tgt
-        firewall-cmd --permanent --zone="$z" --set-target="$tgt"
-    done < <(firewall-cmd --get-active-zones 2>/dev/null | grep -v '^\s')
+        firewall-cmd --permanent --zone="$z" --set-target="$tgt" || return 1
+    done < <(active_firewall_zones)
     firewall-cmd --reload
 }
 audit_4_1_5() {
@@ -1572,7 +1613,7 @@ run_section_5() {
     run_check "5.1.12" "L1S,L1W" "AUTO" "Ensure sshd KexAlgorithms is configured" "audit_sshd_param kexalgorithms '^kexalgorithms\h+([^#\n\r]+,)?(diffie-hellman-group1-sha1|diffie-hellman-group14-sha1|diffie-hellman-group-exchange-sha1)\b' 1" "fix_1_6_2" "disabling weak SHA1 KexAlgorithms via crypto policy"
     run_check "5.1.13" "L1S,L1W" "AUTO" "Ensure sshd LoginGraceTime is configured" "audit_5_1_13" "fix_sshd_param LoginGraceTime 60" "setting LoginGraceTime 60"
     run_check "5.1.14" "L1S,L1W" "AUTO" "Ensure sshd LogLevel is configured" "audit_sshd_param loglevel '^loglevel\h+(VERBOSE|INFO)\b'" "fix_sshd_param LogLevel VERBOSE" "setting LogLevel VERBOSE"
-    run_check "5.1.15" "L1S,L1W" "AUTO" "Ensure sshd MACs are configured" "audit_sshd_param macs '^macs\h+([^#\n\r]+,)?(hmac-md5|hmac-md5-96|hmac-sha1-96|umac-64@openssh\.com|hmac-md5-etm@openssh\.com|hmac-md5-96-etm@openssh\.com|hmac-sha1-etm@openssh\.com|hmac-sha1-96-etm@openssh\.com|umac-64-etm@openssh\.com)\b' 1" "fix_1_6_3" "disabling weak SSH MACs via crypto policy"
+    run_check "5.1.15" "L1S,L1W" "AUTO" "Ensure sshd MACs are configured" "audit_sshd_param macs '^macs\h+([^#\n\r]+,)?(hmac-md5|hmac-md5-96|hmac-sha1-96|umac-64@openssh\.com|hmac-md5-etm@openssh\.com|hmac-md5-96-etm@openssh\.com|hmac-sha1-etm@openssh\.com|hmac-sha1-96-etm@openssh\.com|umac-64-etm@openssh\.com)\b' 1" "fix_5_1_15" "disabling weak SSH MACs via crypto policy and restarting sshd"
     run_check "5.1.16" "L1S,L1W" "AUTO" "Ensure sshd MaxAuthTries is configured" "audit_5_1_16" "fix_sshd_param MaxAuthTries 4" "setting MaxAuthTries 4"
     run_check "5.1.17" "L1S,L1W" "AUTO" "Ensure sshd MaxStartups is configured" "audit_5_1_17" "fix_sshd_param MaxStartups 10:30:60" "setting MaxStartups 10:30:60"
     run_check "5.1.18" "L1S,L1W" "AUTO" "Ensure sshd MaxSessions is configured" "audit_5_1_18" "fix_sshd_param MaxSessions 10" "setting MaxSessions 10"
@@ -2094,7 +2135,9 @@ run_section_6() {
 
     # 6.3.3 Auditd Rules
     run_check "6.3.3.1"  "L2S,L2W" "AUTO" "Ensure modification of the /etc/sudoers file is collected" "audit_auditd_rule 'path=/etc/sudoers.*key=scope'" "fix_auditd_rule /etc/audit/rules.d/50-scope.rules '-a always,exit -F arch=b64 -S all -F path=/etc/sudoers -F perm=wa -F key=scope' '-a always,exit -F arch=b64 -S all -F dir=/etc/sudoers.d -F perm=wa -F key=scope'" "adding sudoers scope audit rules"
-    run_check "6.3.3.2"  "L2S,L2W" "AUTO" "Ensure actions as another user are always logged" "audit_auditd_rule 'euid!=uid.*execve.*user_emulation'" "fix_auditd_rule /etc/audit/rules.d/50-user_emulation.rules '-a always,exit -F arch=b64 -C euid!=uid -F auid!=unset -S execve -k user_emulation'" "adding user_emulation audit rule"
+    # auditctl -l may list the syscall before the -C comparison, so accept
+    # either field order when verifying the active rule.
+    run_check "6.3.3.2"  "L2S,L2W" "AUTO" "Ensure actions as another user are always logged" "audit_auditd_rule '(euid!=uid.*execve.*user_emulation|execve.*euid!=uid.*user_emulation)'" "fix_auditd_rule /etc/audit/rules.d/50-user_emulation.rules '-a always,exit -F arch=b64 -C euid!=uid -F auid!=unset -S execve -k user_emulation'" "adding user_emulation audit rule"
     run_check "6.3.3.3"  "L2S,L2W" "AUTO" "Ensure events that modify the sudo log file are collected" "audit_auditd_rule 'key=sudo_log_file'" "fix_6_3_3_3" "adding sudo log file audit rule"
     run_check "6.3.3.4"  "L2S,L2W" "AUTO" "Ensure events that modify date and time information are collected" "audit_auditd_rule 'time-change'" "fix_auditd_rule /etc/audit/rules.d/50-time-change.rules '-a always,exit -F arch=b64 -S adjtimex,settimeofday -k time-change' '-a always,exit -F arch=b64 -S clock_settime -F a0=0x0 -k time-change' '-a always,exit -F arch=b64 -S all -F path=/etc/localtime -F perm=wa -F key=time-change'" "adding time-change audit rules"
     run_check "6.3.3.5"  "L2S,L2W" "AUTO" "Ensure events that modify sethostname and setdomainname are collected" "audit_auditd_rule 'sethostname,setdomainname.*system-locale'" "fix_auditd_rule /etc/audit/rules.d/50-system_locale.rules '-a always,exit -F arch=b64 -S sethostname,setdomainname -k system-locale'" "adding sethostname/setdomainname audit rule"
@@ -2399,7 +2442,8 @@ audit_6_3_4_logs() {
     d="$(dirname "$(awk -F= '/^\s*log_file\s*=/{print $2}' /etc/audit/auditd.conf 2>/dev/null | xargs)" 2>/dev/null || echo /var/log/audit)"
     [[ -d "$d" ]] || return 0
     case "$what" in
-        mode)  find "$d" -type f -perm /0177 | grep -q . && { CHECK_DETAIL="Audit log files with mode > 0600"; return 1; } ;;
+        # CIS 6.3.4.2 allows 0640 or more restrictive (perm mask 0137).
+        mode)  find "$d" -maxdepth 1 -type f -perm /0137 | grep -q . && { CHECK_DETAIL="Audit log files with mode > 0640"; return 1; } ;;
         owner) find "$d" -type f ! -user root | grep -q . && { CHECK_DETAIL="Audit log files not owned by root"; return 1; } ;;
         group) find "$d" -type f ! -group root | grep -q . && { CHECK_DETAIL="Audit log files not group-owned by root"; return 1; } ;;
     esac
