@@ -762,20 +762,6 @@ audit_auditd_flag() {
     return 0
 }
 
-# Older versions of this script used "grep -Fxq \"$line\"" where $line starts
-# with '-' (e.g. -c, -a ...). GNU grep parsed it as an option, never found the
-# line, and appended another copy on every run. Remove those duplicates while
-# preserving file order and any comments/blank lines.
-dedupe_rule_file() {
-    local f="$1" tmp
-    [[ -f "$f" ]] || return 0
-    tmp="$(mktemp "${f}.XXXXXX" 2>/dev/null)" || return 0
-    if awk 'NF && seen[$0]++ {next} {print}' "$f" > "$tmp"; then
-        cat "$tmp" > "$f"
-    fi
-    rm -f "$tmp"
-}
-
 # Reload merged audit rules, but do not wait forever and do not attempt a
 # runtime change when the running configuration is already immutable (-e 2).
 reload_audit_rules() {
@@ -786,23 +772,70 @@ reload_audit_rules() {
         log_msg "[NOTE] Audit rules are immutable (enabled 2); reload skipped until reboot."
         return 0
     fi
-    run_with_timeout 30 augenrules --load >/dev/null 2>&1 || true
+    run_with_timeout 30 augenrules --load >/dev/null
 }
+
+# Read candidate rules from stdin. Keep other rule files in place and retain
+# the order and formatting of the surviving lines in the destination.
+write_audit_rule_file() (
+    local target="$1" mode="$2" dir="${1%/*}" existing=/dev/null
+    local file tmp lock_fd
+    local -a other_files=()
+    mkdir -p -- "$dir" || return 1
+    exec {lock_fd}< "$dir" || return 1
+    flock -x "$lock_fd" || return 1
+    if [[ -e "$target" || -L "$target" ]]; then
+        target="$(realpath -e -- "$target")" || return 1
+        [[ -f "$target" ]] || return 1
+        existing="$target"
+    fi
+    for file in "$dir"/*.rules; do
+        [[ "$file" -ef "$target" ]] || other_files+=("$file")
+    done
+    tmp="$(mktemp -- "${target}.XXXXXX")" || return 1
+    trap 'rm -f -- "$tmp"' EXIT
+
+    if ! awk -v mode="$mode" '
+        function rule_key(line) {
+            sub(/^[[:blank:]]+/, "", line)
+            sub(/[[:blank:]]+$/, "", line)
+            # Keep whitespace within quoted or escaped arguments significant.
+            if (line !~ /["\047\\]/) {
+                gsub(/[[:blank:]]+/, " ", line)
+                gsub(/ -F key=/, " -k ", line)
+            }
+            return line
+        }
+        { key = rule_key($0) }
+        phase == "other" { external[key] = 1; next }
+        phase == "existing" {
+            if (mode == "replace") next
+            # Deletion commands can make a later re-add intentional.
+            if (key ~ /^-(d|D|W)( |$)/) delete seen
+            if (key ~ /^-e / && key != "-e 2") delete seen["-e 2"]
+            if ((key ~ /^-(a|w) / || key == "-c" || key == "-e 2") &&
+                seen[key]++) next
+            print
+            next
+        }
+        key != "" && !seen[key]++ && !(key in external) { print }
+    ' phase=other "${other_files[@]}" phase=existing "$existing" phase=requested - > "$tmp"; then
+        return 1
+    fi
+
+    if ! cmp -s -- "$existing" "$tmp"; then
+        if [[ "$existing" != /dev/null ]]; then
+            cp --attributes-only --preserve=all -- "$existing" "$tmp" || return 1
+        fi
+        mv -fT -- "$tmp" "$target" || return 1
+    fi
+    # A prior load can have failed even when all candidate rules are on disk.
+    reload_audit_rules
+)
 
 fix_auditd_rule() {
     local rfile="$1"; shift
-    mkdir -p /etc/audit/rules.d
-    local line added=0
-    dedupe_rule_file "$rfile"
-    for line in "$@"; do
-        # "--" stops grep from reading "-c"/"-a ..." as options.
-        if ! grep -Fxq -- "$line" "$rfile" 2>/dev/null; then
-            printf '%s\n' "$line" >> "$rfile"
-            added=1
-        fi
-    done
-    [[ "$added" -eq 1 ]] && reload_audit_rules
-    return 0
+    printf '%s\n' "$@" | write_audit_rule_file "$rfile" merge
 }
 
 # --- pwquality / faillock / login.defs Helpers --------------------------------
@@ -1614,7 +1647,10 @@ fix_4_1_3() {
 # CIS 4.1.4 applies to real interfaces, while 4.1.5/4.1.6 configure the
 # loopback zone separately. A zone active only through sources is kept.
 active_firewall_zones() {
-    local line zone="" iface has_iface=0 has_real=0 ifaces
+    local output line zone="" iface has_iface=0 has_real=0 ifaces
+    if ! output="$(LC_ALL=C firewall-cmd --get-active-zones)"; then
+        return 1
+    fi
     while IFS= read -r line; do
         if [[ "$line" =~ ^[[:space:]] ]]; then
             [[ "$line" =~ ^[[:space:]]*interfaces:[[:space:]]*(.*)$ ]] || continue
@@ -1635,9 +1671,60 @@ active_firewall_zones() {
             has_iface=0
             has_real=0
         fi
-    done < <(firewall-cmd --get-active-zones 2>/dev/null)
+    done <<< "$output"
     if [[ -n "$zone" ]] && { [[ "$has_iface" -eq 0 ]] || [[ "$has_real" -eq 1 ]]; }; then
         printf '%s\n' "$zone"
+    fi
+}
+
+firewall_runtime_target() {
+    local zone="$1" output target
+    output="$(LC_ALL=C firewall-cmd --zone="$zone" --list-all)" || return 1
+    target="$(awk '/^[[:blank:]]*target:/ {
+        sub(/^[[:blank:]]*target:[[:space:]]*/, "")
+        sub(/[[:space:]]+$/, "")
+        print
+        exit
+    }' <<< "$output")"
+    if [[ -n "$target" ]]; then
+        printf '%s\n' "$target"
+        return 0
+    fi
+    # Some versions omit the target from the CLI listing. Query the running
+    # daemon through the firewalld client in that case.
+    run_with_timeout 10 /usr/bin/python3 - "$zone" <<'PYTHON'
+import sys
+from firewall.client import FirewallClient
+
+zone = FirewallClient().getZoneSettings(sys.argv[1])
+target = zone.getTarget()
+if not target:
+    sys.exit(1)
+print(target)
+PYTHON
+}
+
+audit_firewall_zone_target() {
+    local zone="$1" permanent runtime
+    if ! permanent="$(LC_ALL=C firewall-cmd --permanent --zone="$zone" --get-target)" || [[ -z "$permanent" ]]; then
+        CHECK_DETAIL="Active zone '$zone' has no readable permanent target."
+        return 1
+    fi
+    if ! runtime="$(firewall_runtime_target "$zone")" || [[ -z "$runtime" ]]; then
+        CHECK_DETAIL="Active zone '$zone' has no readable runtime target."
+        return 1
+    fi
+    permanent="${permanent,,}"
+    runtime="${runtime,,}"
+    [[ "$permanent" == '%%reject%%' ]] && permanent=reject
+    [[ "$runtime" == '%%reject%%' ]] && runtime=reject
+    case "$runtime" in
+        drop|reject|default) ;;
+        *) CHECK_DETAIL="Active zone '$zone' has target '$runtime' (expected DROP, REJECT, or default)."; return 1 ;;
+    esac
+    if [[ "$permanent" != "$runtime" ]]; then
+        CHECK_DETAIL="Active zone '$zone' has runtime target '$runtime' and permanent target '$permanent'."
+        return 1
     fi
 }
 
@@ -1645,47 +1732,48 @@ audit_4_1_4() {
     require_cmd firewall-cmd || return $?
     require_root || return $?
     systemctl is-active firewalld.service >/dev/null 2>&1 || { CHECK_DETAIL="firewalld is not active."; return 2; }
-    local z ptarget runtime_target
+    local zones z
+    if ! zones="$(active_firewall_zones)"; then
+        CHECK_DETAIL="Unable to query active firewalld zones."
+        return 1
+    fi
+    if [[ -z "$zones" ]]; then
+        CHECK_DETAIL="No active firewalld zone is in scope for 4.1.4."
+        return 1
+    fi
     while IFS= read -r z; do
-        [[ -z "$z" ]] && continue
-        # --get-target is only accepted with --permanent on this firewalld
-        # version; the runtime target is reported by --list-all instead.
-        ptarget="$(firewall-cmd --permanent --zone="$z" --get-target 2>/dev/null || true)"
-        runtime_target="$(firewall-cmd --list-all --zone="$z" 2>/dev/null | awk -F: '
-            /^[[:space:]]*target:/ { gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit }
-        ')"
-        [[ -n "$ptarget" ]] || { CHECK_DETAIL="Active zone '$z' has no readable permanent target."; return 1; }
-        [[ -n "$runtime_target" ]] || { CHECK_DETAIL="Active zone '$z' has no readable runtime target."; return 1; }
-        if [[ "${ptarget,,}" != "${runtime_target,,}" ]]; then
-            CHECK_DETAIL="Active zone '$z' target '$runtime_target' is not a permanent firewall rule (permanent target: '$ptarget')."
-            return 1
-        fi
-        if [[ ! "$ptarget" =~ ^(DROP|REJECT|default)$ ]]; then
-            CHECK_DETAIL="Active zone '$z' has target '$ptarget' (expected DROP, REJECT, or default)."
-            return 1
-        fi
-    done < <(active_firewall_zones)
+        audit_firewall_zone_target "$z" || return 1
+    done <<< "$zones"
     return 0
 }
 fix_4_1_4() {
-    local z tgt="" choice
-    while IFS= read -r z; do
-        [[ -z "$z" ]] && continue
-        # A zone *target* is DROP/REJECT/default - not a zone name such as
-        # "trusted". Validate before handing the value to firewall-cmd so a
-        # typo produces a useful prompt instead of INVALID_TARGET.
+    local zones z tgt i
+    local -a zone_list=() changed_zones=() targets=()
+    zones="$(active_firewall_zones)" || return 1
+    if [[ -z "$zones" ]]; then
+        printf '       No active firewalld zone is in scope for 4.1.4.\n' >&2
+        return 1
+    fi
+    mapfile -t zone_list <<< "$zones"
+    for z in "${zone_list[@]}"; do
+        audit_firewall_zone_target "$z" && continue
         while :; do
-            ask_input "Enter target for firewalld zone '$z' (DROP, REJECT, or default)" "DROP" tgt
-            choice="${tgt,,}"
-            case "$choice" in
-                drop)    tgt="DROP"; break ;;
+            read -r -p "  -> Enter target for firewalld zone '$z' (DROP, REJECT, or default) [DROP]: " tgt || return 1
+            case "${tgt,,}" in
+                ''|drop) tgt="DROP"; break ;;
                 reject)  tgt="REJECT"; break ;;
                 default) tgt="default"; break ;;
+                trusted) printf "       'trusted' is a zone name. Choose DROP, REJECT, or default.\n" ;;
                 *) printf "       Invalid target '%s'. Expected DROP, REJECT, or default.\n" "$tgt" ;;
             esac
         done
-        firewall-cmd --permanent --zone="$z" --set-target="$tgt" || return 1
-    done < <(active_firewall_zones)
+        changed_zones+=("$z")
+        targets+=("$tgt")
+    done
+    (( ${#changed_zones[@]} > 0 )) || return 0
+    for i in "${!changed_zones[@]}"; do
+        firewall-cmd --permanent --zone="${changed_zones[i]}" --set-target="${targets[i]}" || return 1
+    done
     firewall-cmd --reload
 }
 audit_4_1_5() {
@@ -2542,15 +2630,20 @@ fix_6_3_3_3() {
     fix_auditd_rule /etc/audit/rules.d/50-sudo.rules "-a always,exit -F arch=b64 -S all -F path=${lf} -F perm=wa -F key=sudo_log_file"
 }
 fix_6_3_3_10() {
-    local uid_min part
-    uid_min="$(awk '/^\s*UID_MIN/{print $2}' /etc/login.defs)"
-    mkdir -p /etc/audit/rules.d
-    : > /etc/audit/rules.d/50-privileged.rules
-    for part in $(findmnt -n -l -k -it "$(awk '/nodev/{print $2}' /proc/filesystems | paste -sd,)" | grep -Pv 'noexec|nosuid' | awk '{print $1}'); do
-        find "$part" -xdev -perm /6000 -type f 2>/dev/null | awk -v u="$uid_min" '{print "-a always,exit -F arch=b64 -S all -F path="$1" -F perm=x -F auid>="u" -F auid!=unset -k privileged"}' >> /etc/audit/rules.d/50-privileged.rules
-    done
-    sort -u -o /etc/audit/rules.d/50-privileged.rules /etc/audit/rules.d/50-privileged.rules
-    reload_audit_rules
+    local uid_min part mounts rules
+    uid_min="$(awk '$1 == "UID_MIN" {print $2; exit}' /etc/login.defs)" || return 1
+    [[ "$uid_min" =~ ^[0-9]+$ ]] || { printf 'Unable to read UID_MIN from /etc/login.defs.\n' >&2; return 1; }
+    mounts="$(findmnt -n -l -k -it "$(awk '/nodev/{print $2}' /proc/filesystems | paste -sd,)")" || return 1
+    rules="$(
+        set -o pipefail
+        while IFS= read -r part; do
+            [[ -n "$part" ]] || continue
+            find "$part" -xdev -perm /6000 -type f -print || exit 1
+        done < <(awk '!/noexec|nosuid/ {print $1}' <<< "$mounts") |
+            LC_ALL=C sort -u |
+            awk -v u="$uid_min" '{print "-a always,exit -F arch=b64 -S all -F path="$0" -F perm=x -F auid>="u" -F auid!=unset -k privileged"}'
+    )" || return 1
+    printf '%s\n' "$rules" | write_audit_rule_file /etc/audit/rules.d/50-privileged.rules replace
 }
 audit_6_3_3_37() {
     require_cmd augenrules || return $?
