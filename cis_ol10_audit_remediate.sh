@@ -937,7 +937,7 @@ run_section_1() {
     run_check "1.2.1.1" "L1S,L1W" "MANUAL" "Ensure GPG keys are configured" "manual_only" "manual_only" "Verify GPG keys via 'rpm -q gpg-pubkey' and /etc/yum.repos.d/*.repo"
     run_check "1.2.1.2" "L1S,L1W" "AUTO"   "Ensure gpgcheck is configured" "audit_1_2_1_2" "fix_1_2_1_2" "setting gpgcheck=1 in /etc/dnf/dnf.conf and /etc/yum.repos.d/*.repo"
     run_check "1.2.1.3" "L2S,L2W" "MANUAL" "Ensure repo_gpgcheck is globally activated" "audit_1_2_1_3" "fix_1_2_1_3" "setting repo_gpgcheck=1 in /etc/dnf/dnf.conf"
-    run_check "1.2.1.4" "L1S,L1W" "MANUAL" "Ensure package manager repositories are configured" "manual_only" "manual_only" "Verify 'dnf repolist' matches site policy"
+    run_check "1.2.1.4" "L1S,L1W" "MANUAL" "Ensure package manager repositories are configured" "audit_1_2_1_4" "manual_only" "Verify the enabled repositories and their configuration match site policy"
     run_check "1.2.1.5" "L2S,L2W" "AUTO"   "Ensure weak dependencies are configured" "audit_1_2_1_5" "fix_1_2_1_5" "setting install_weak_deps=0 in /etc/dnf/dnf.conf"
     run_check "1.2.2.1" "L1S,L1W" "MANUAL" "Ensure updates, patches, and additional security software are installed" "audit_1_2_2_1" "fix_1_2_2_1" "running dnf update"
 
@@ -1022,6 +1022,16 @@ fix_1_2_1_3() {
     else
         printf '\nrepo_gpgcheck=1\n' >> /etc/dnf/dnf.conf
     fi
+}
+audit_1_2_1_4() {
+    require_cmd dnf || return $?
+    local repositories
+    if repositories="$(LC_ALL=C dnf -q repolist 2>/dev/null)"; then
+        CHECK_DETAIL="Enabled DNF repositories:"$'\n'"${repositories:-None listed.}"
+    else
+        CHECK_DETAIL="Unable to list repositories with 'dnf repolist'."
+    fi
+    return 1
 }
 audit_1_2_1_5() {
     grep -Pqi '^\h*install_weak_deps\h*=\h*(0|false|no)\b' /etc/dnf/dnf.conf 2>/dev/null || { CHECK_DETAIL="install_weak_deps=0 not set in /etc/dnf/dnf.conf"; return 1; }
@@ -1623,7 +1633,7 @@ run_section_4() {
     run_check "4.1.4" "L1S,L1W" "AUTO"   "Ensure firewalld active zone target is configured" "audit_4_1_4" "fix_4_1_4" "setting firewalld active zone target (DROP/REJECT/default)" 1
     run_check "4.1.5" "L1S,L1W" "MANUAL" "Ensure firewalld loopback traffic is configured" "audit_4_1_5" "fix_4_1_5" "assigning lo interface to trusted zone in firewalld"
     run_check "4.1.6" "L1S,L1W" "MANUAL" "Ensure firewalld loopback source address traffic is configured" "audit_4_1_6" "fix_4_1_6" "adding loopback drop rich rules to firewalld" 1
-    run_check "4.1.7" "L1S,L1W" "MANUAL" "Ensure firewalld services and ports are configured" "manual_only" "manual_only" "Review 'firewall-cmd --list-all' and remove unapproved services/ports"
+    run_check "4.1.7" "L1S,L1W" "MANUAL" "Ensure firewalld services and ports are configured" "audit_4_1_7" "manual_only" "Review the listed services and ports against site policy"
 }
 
 audit_4_1_2() {
@@ -1798,6 +1808,36 @@ fix_4_1_6() {
     firewall-cmd --permanent --zone="$z" --add-rich-rule='rule family=ipv4 source address="127.0.0.1" destination not address="127.0.0.1" drop'
     firewall-cmd --permanent --zone="$z" --add-rich-rule='rule family=ipv6 source address="::1" destination not address="::1" drop'
     firewall-cmd --reload
+}
+
+audit_4_1_7() {
+    require_cmd firewall-cmd || return $?
+    local active_zones zone settings
+    if ! active_zones="$(LC_ALL=C firewall-cmd --get-active-zones 2>/dev/null)"; then
+        CHECK_DETAIL="Unable to list active firewalld zones. Check whether firewalld is running."
+        return 1
+    fi
+    if [[ -z "$active_zones" ]]; then
+        CHECK_DETAIL="No active firewalld zones reported."
+        return 1
+    fi
+
+    CHECK_DETAIL="Runtime services and explicitly allowed ports by active firewalld zone:"
+    while read -r zone; do
+        CHECK_DETAIL+=$'\n'"Zone $zone:"
+        if settings="$(LC_ALL=C firewall-cmd --zone="$zone" --list-all 2>/dev/null)"; then
+            CHECK_DETAIL+=$'\n'"$(awk '
+                /^[[:blank:]]*(services|ports):/ {
+                    sub(/^[[:blank:]]+/, "")
+                    sub(/[[:blank:]]+$/, "")
+                    print "  " $0 ($0 ~ /:$/ ? " (none)" : "")
+                }
+            ' <<< "$settings")"
+        else
+            CHECK_DETAIL+=$'\n'"  Unable to read zone settings."
+        fi
+    done < <(awk '/^[^[:space:]]/ {print $1}' <<< "$active_zones")
+    return 1
 }
 
 #===============================================================================
