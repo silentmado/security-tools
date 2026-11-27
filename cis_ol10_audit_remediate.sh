@@ -2629,8 +2629,11 @@ fix_6_2_3_7() {
 }
 audit_6_2_4_1() {
     local bad
-    bad="$(find /var/log -type f -perm /0137 2>/dev/null | head -n5)"
-    [[ -z "$bad" ]] || { CHECK_DETAIL="Log files with overly permissive mode found under /var/log"; return 1; }
+    bad="$(find /var/log -type f -perm /0137 2>/dev/null)"
+    if [[ -n "$bad" ]]; then
+        CHECK_DETAIL="Log files with overly permissive mode under /var/log:"$'\n'"$bad"
+        return 1
+    fi
 }
 fix_6_2_4_1() {
     find /var/log -type f -perm /0137 -exec chmod u-x,g-wx,o-rwx {} + 2>/dev/null || true
@@ -2708,14 +2711,20 @@ fix_6_3_4_dir() {
     chmod g-w,o-rwx "$d"
 }
 audit_6_3_4_logs() {
-    local what="$1" d
+    local what="$1" d bad
     d="$(dirname "$(awk -F= '/^\s*log_file\s*=/{print $2}' /etc/audit/auditd.conf 2>/dev/null | xargs)" 2>/dev/null || echo /var/log/audit)"
     [[ -d "$d" ]] || return 0
     case "$what" in
         # CIS 6.3.4.2 allows 0640 or more restrictive (perm mask 0137).
         mode)  find "$d" -maxdepth 1 -type f -perm /0137 | grep -q . && { CHECK_DETAIL="Audit log files with mode > 0640"; return 1; } ;;
         owner) find "$d" -type f ! -user root | grep -q . && { CHECK_DETAIL="Audit log files not owned by root"; return 1; } ;;
-        group) find "$d" -type f ! -group root | grep -q . && { CHECK_DETAIL="Audit log files not group-owned by root"; return 1; } ;;
+        group)
+            bad="$(find "$d" -type f ! -group root)"
+            if [[ -n "$bad" ]]; then
+                CHECK_DETAIL="Audit log files not group-owned by root:"$'\n'"$bad"
+                return 1
+            fi
+            ;;
     esac
     return 0
 }
